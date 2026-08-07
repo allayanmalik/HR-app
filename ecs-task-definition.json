@@ -1,0 +1,41 @@
+{
+  "family": "hr-app",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::805982516676:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::805982516676:role/hr-app-task-role",
+  "containerDefinitions": [
+    {
+      "name": "hr-app",
+      "image": "805982516676.dkr.ecr.eu-west-2.amazonaws.com/hr-app:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 5000,
+          "hostPort": 5000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "NODE_ENV", "value": "production" },
+        { "name": "PORT", "value": "5000" },
+        { "name": "JWT_SECRET", "value": "replace-with-a-long-random-secret" },
+        { "name": "APP_URL", "value": "https://your-domain.example.com" },
+        { "name": "ADMIN_EMAIL", "value": "allayanmalik@gmail.com" },
+        { "name": "ADMIN_PASSWORD", "value": "replace-with-a-strong-password" },
+        { "name": "AWS_REGION", "value": "eu-west-2" },
+        { "name": "S3_BUCKET", "value": "replace-with-your-s3-bucket-name" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/hr-app",
+          "awslogs-region": "eu-west-2",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}
