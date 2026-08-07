@@ -12,7 +12,7 @@ jobs:
       AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION != '' && secrets.AWS_REGION || 'eu-west-2' }}
       AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
       ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-      ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+      ECS_CLUSTER: ${{ secrets.ECS_CLUSTER != '' && secrets.ECS_CLUSTER || 'hr-app-cluster' }}
       ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
     steps:
       - name: Checkout
