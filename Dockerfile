@@ -5,5 +5,6 @@ RUN npm install
 COPY . .
 RUN npm run build
 ENV NODE_ENV=production
-EXPOSE 5000
+ENV PORT=80
+EXPOSE 80
 CMD [ "node", "server.js" ]
