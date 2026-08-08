@@ -15,7 +15,20 @@ const JWT_SECRET = process.env.JWT_SECRET || "super-secret-production-key-change
 
 app.use(express.json({ limit: "25mb" })); // Increased limit to support PDF uploading
 app.use(cookieParser());
-app.use(cors({ origin: "http://localhost:5173", credentials: true }));
+const allowedCorsOrigins = new Set([
+  "http://localhost:5173",
+  "https://am-service.co.uk",
+  process.env.APP_URL,
+  process.env.CORS_ORIGIN
+].filter(Boolean));
+
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedCorsOrigins.has(origin)) return callback(null, true);
+    return callback(new Error(`CORS blocked for origin: ${origin}`));
+  },
+  credentials: true
+}));
 
 /* ---------------------------------------------------------------------- */
 /* In-Memory Database                                                      */

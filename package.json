@@ -24,8 +24,10 @@
     "jsonwebtoken": "^9.0.3",
     "lucide-react": "^1.29.0",
     "multer": "^2.2.0",
+    "multer-s3": "^3.0.1",
     "nodemailer": "^9.0.5",
     "pdf-lib": "^1.17.1",
+    "pg": "^8.22.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "tailwindcss": "^4.3.3"

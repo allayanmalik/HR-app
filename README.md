@@ -59,6 +59,13 @@ Required:
 - `ADMIN_EMAIL`
 - `ADMIN_PASSWORD`
 
+PostgreSQL:
+- `DB_HOST` (default `hr-portal-db.c5m4oagyag9k.eu-west-2.rds.amazonaws.com`)
+- `DB_PORT` (default `5432`)
+- `DB_USER` (default `postgres`)
+- `DB_PASSWORD`
+- `DB_NAME` (default `postgres`)
+
 Email options:
 - SMTP mode:
 	- `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`
@@ -69,8 +76,8 @@ Email options:
 - Dev fallback mode:
 	- `DEV_EMAIL_TO_CONSOLE=true`
 
-S3 documents (optional but recommended for AWS):
-- `S3_BUCKET`
+S3 documents:
+- `S3_BUCKET_NAME` (default `hr-app-docs-1892298022`)
 - `AWS_REGION`
 - IAM role/credentials with S3 access
 
@@ -114,8 +121,12 @@ Runtime app secrets (set in ECS task definition or parameter store):
 - `APP_URL`
 - `ADMIN_EMAIL`
 - `ADMIN_PASSWORD`
-- `S3_BUCKET`
+- `VITE_API_URL` (set to `https://am-service.co.uk/api` for production builds, or leave unset to use the same-origin `/api` fallback)
+- `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`
+- `S3_BUCKET_NAME`
 - SMTP or SES variables
+
+For local development, keep `APP_URL=http://localhost:5173` and `VITE_API_URL=http://localhost:5000/api`.
 
 ### 4) Deploy
 

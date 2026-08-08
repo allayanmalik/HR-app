@@ -22,7 +22,20 @@ const passwordResetTokens = new Map();
 
 app.use(express.json({ limit: "25mb" }));
 app.use(cookieParser());
-app.use(cors({ origin: true, credentials: true }));
+const allowedCorsOrigins = new Set([
+  "http://localhost:5173",
+  "https://am-service.co.uk",
+  process.env.APP_URL,
+  process.env.CORS_ORIGIN
+].filter(Boolean));
+
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedCorsOrigins.has(origin)) return callback(null, true);
+    return callback(new Error(`CORS blocked for origin: ${origin}`));
+  },
+  credentials: true
+}));
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
@@ -124,7 +137,7 @@ function generateCode() {
 }
 
 function getAppBaseUrl() {
-  return process.env.APP_URL || "http://localhost:5173";
+  return process.env.APP_URL || (process.env.NODE_ENV === "production" ? "https://am-service.co.uk" : "http://localhost:5173");
 }
 
 function createPasswordResetToken(user, type = "reset") {

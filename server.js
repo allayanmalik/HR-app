@@ -5,12 +5,13 @@ import cors from "cors";
 import cookieParser from "cookie-parser";
 import fs from "fs";
 import path from "path";
-import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { SESClient, SendEmailCommand } from "@aws-sdk/client-ses";
 import docusign from "docusign-esign";
 import { PDFDocument } from "pdf-lib";
 import dotenv from "dotenv";
 import { createTransport } from "nodemailer";
+import { appendAuditLog, ensureDatabaseSchema, loadPersistentState, persistPersistentState } from "./db.js";
+import { AWS_REGION, S3_BUCKET_NAME, deleteObjectFromS3, getDocumentUploadMiddleware, getObjectFromS3, uploadBufferToS3 } from "./storage.js";
 
 dotenv.config();
 
@@ -30,7 +31,20 @@ if (process.env.NODE_ENV === "production" && (!process.env.JWT_SECRET || process
 
 app.use(express.json({ limit: "25mb" }));
 app.use(cookieParser());
-app.use(cors({ origin: true, credentials: true }));
+const allowedCorsOrigins = new Set([
+  "http://localhost:5173",
+  "https://am-service.co.uk",
+  process.env.APP_URL,
+  process.env.CORS_ORIGIN
+].filter(Boolean));
+
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedCorsOrigins.has(origin)) return callback(null, true);
+    return callback(new Error(`CORS blocked for origin: ${origin}`));
+  },
+  credentials: true
+}));
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
@@ -137,11 +151,9 @@ let db = {
   staff: [],
   templates: [],
   instances: [],
-  docusignEnvelopes: []
+  docusignEnvelopes: [],
+  audit: []
 };
-
-// Simple in-memory audit log
-db.audit = [];
 
 function addAudit(action, user, details = {}) {
   try {
@@ -153,14 +165,9 @@ function addAudit(action, user, details = {}) {
       details
     };
     db.audit.unshift(entry);
-    // Persist audit entry to disk (append JSONL) for durability
-    try {
-      const dataDir = path.resolve("./data");
-      if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-      fs.appendFileSync(path.join(dataDir, "audit.log"), JSON.stringify(entry) + "\n");
-    } catch (err) {
-      console.error("Failed to persist audit entry to disk:", err && err.message ? err.message : err);
-    }
+    void appendAuditLog(entry).catch((err) => {
+      console.error("Failed to persist audit entry to PostgreSQL:", err && err.message ? err.message : err);
+    });
     return entry;
   } catch (err) {
     console.error('Failed to record audit entry', err && err.message ? err.message : err);
@@ -168,59 +175,33 @@ function addAudit(action, user, details = {}) {
   }
 }
 
-// Persistent DB helpers (JSON file). Keeps current in-memory `db` in sync with disk.
-const DB_FILE = path.resolve("./data/db.json");
-function loadDbFromDisk() {
-  try {
-    if (fs.existsSync(DB_FILE)) {
-      const raw = fs.readFileSync(DB_FILE, "utf8");
-      const parsed = JSON.parse(raw);
-      // Merge into in-memory db, preserve structures
-      db.users = parsed.users || db.users;
-      db.sites = parsed.sites || db.sites;
-      db.staff = parsed.staff || db.staff;
-      db.templates = parsed.templates || db.templates;
-      db.instances = parsed.instances || db.instances;
-      db.docusignEnvelopes = parsed.docusignEnvelopes || db.docusignEnvelopes;
-      db.audit = parsed.audit || db.audit;
-      console.log("Loaded persisted DB from disk");
-    }
-  } catch (err) {
-    console.warn("Failed to load DB from disk:", err && err.message ? err.message : err);
-  }
-}
-
 function saveDbToDisk() {
-  try {
-    const dataDir = path.resolve("./data");
-    if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-    const snapshot = {
-      users: db.users,
-      sites: db.sites,
-      staff: db.staff,
-      templates: db.templates,
-      instances: db.instances,
-      docusignEnvelopes: db.docusignEnvelopes,
-      audit: db.audit
-    };
-    fs.writeFileSync(DB_FILE, JSON.stringify(snapshot, null, 2), "utf8");
-  } catch (err) {
-    console.error("Failed to persist DB to disk:", err && err.message ? err.message : err);
+  return persistPersistentState(db).catch((err) => {
+    console.error("Failed to persist DB to PostgreSQL:", err && err.message ? err.message : err);
+  });
+}
+
+async function bootstrapDatabase() {
+  await ensureDatabaseSchema();
+  const { state, hasData } = await loadPersistentState(db);
+  Object.assign(db, state);
+  if (!db.users || db.users.length === 0) {
+    db.users = buildInitialUsers();
   }
+  if (!hasData) {
+    await persistPersistentState(db);
+  }
+  console.log("Loaded persisted DB from PostgreSQL", {
+    host: process.env.DB_HOST || "hr-portal-db.c5m4oagyag9k.eu-west-2.rds.amazonaws.com",
+    database: process.env.DB_NAME || "postgres",
+    region: AWS_REGION,
+    bucket: S3_BUCKET_NAME
+  });
 }
 
-// Load DB at startup
-loadDbFromDisk();
+const documentUpload = getDocumentUploadMiddleware();
 
-// Configure S3 if credentials provided; otherwise use local file storage
-const S3_BUCKET = process.env.S3_BUCKET || null;
-let s3 = null;
-if (process.env.AWS_REGION && S3_BUCKET) {
-  s3 = new S3Client({ region: process.env.AWS_REGION });
-  console.log("S3 enabled: bucket=", S3_BUCKET);
-} else {
-  console.log("S3 not configured — using local storage for uploaded documents");
-}
+await bootstrapDatabase();
 
 function authenticateToken(req, res, next) {
   const token = req.cookies.token;
@@ -289,7 +270,7 @@ function getDocumentMimeType(fileName = "") {
 }
 
 function getAppBaseUrl() {
-  return process.env.APP_URL || "http://localhost:5173";
+  return process.env.APP_URL || (process.env.NODE_ENV === "production" ? "https://am-service.co.uk" : "http://localhost:5173");
 }
 
 function createPasswordResetToken(user, type = "reset") {
@@ -814,15 +795,17 @@ app.delete("/api/staff/:staffId/training/:recordId", authenticateToken, (req, re
   saveDbToDisk();
 });
 
-app.post("/api/staff/:id/documents", authenticateToken, async (req, res) => {
+app.post("/api/staff/:id/documents", authenticateToken, documentUpload.single("file"), async (req, res) => {
   const staff = db.staff.find((s) => s.id === req.params.id);
   if (!staff) return res.status(404).json({ error: "Staff member not found" });
   // Only allow: global admin, subadmin with access to this staff's site, or the staff member themself
   const allowed = req.user.role === "admin" || (req.user.role === "subadmin" && (req.user.siteAccess || []).includes(staff.siteId)) || req.user.staffId === staff.id;
   if (!allowed) return res.status(403).json({ error: "Access denied for this location" });
 
-  const { title, fileName, documentBase64 } = req.body;
-  if (!fileName || !documentBase64) {
+  const { title } = req.body;
+  const fileName = req.file?.originalname || req.body.fileName;
+  const documentBase64 = req.body.documentBase64;
+  if (!fileName || (!documentBase64 && !req.file)) {
     return res.status(400).json({ error: "A file name and file content are required" });
   }
 
@@ -836,20 +819,14 @@ app.post("/api/staff/:id/documents", authenticateToken, async (req, res) => {
     uploadedBy: req.user.email
   };
 
-  // Upload to S3 if configured, otherwise save to local data/uploads
   try {
-    const buffer = Buffer.from(documentBase64, "base64");
-    if (s3 && S3_BUCKET) {
-      const key = `staff/${staff.id}/${id}/${fileName}`;
-      const params = { Bucket: S3_BUCKET, Key: key, Body: buffer, ContentType: getDocumentMimeType(fileName) };
-      await s3.send(new PutObjectCommand(params));
-      record.s3Key = key;
+    if (req.file?.key) {
+      record.s3Key = req.file.key;
     } else {
-      const uploadsDir = path.resolve("./data/uploads", staff.id);
-      if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
-      const filePath = path.join(uploadsDir, `${id}-${fileName}`);
-      fs.writeFileSync(filePath, buffer);
-      record.s3Key = `local:${filePath}`;
+      const buffer = Buffer.from(documentBase64, "base64");
+      const key = `staff/${staff.id}/${id}/${fileName}`;
+      await uploadBufferToS3({ key, body: buffer, contentType: getDocumentMimeType(fileName) });
+      record.s3Key = key;
     }
   } catch (err) {
     console.error("Failed to store uploaded document:", err && err.message ? err.message : err);
@@ -886,22 +863,10 @@ app.get("/api/staff/:id/documents/:docId/download", authenticateToken, async (re
     return;
   }
 
-  // Otherwise retrieve from S3 or local path
+  // Otherwise retrieve from S3
   try {
-    if (document.s3Key && document.s3Key.startsWith("local:")) {
-      const filePath = document.s3Key.replace(/^local:/, "");
-      if (!fs.existsSync(filePath)) return res.status(404).json({ error: "Document not found on disk" });
-      res.setHeader("Content-Type", getDocumentMimeType(document.fileName));
-      res.setHeader("Content-Disposition", `attachment; filename="${document.fileName}"`);
-      const stream = fs.createReadStream(filePath);
-      stream.pipe(res);
-      addAudit("staff_document_downloaded", req.user, { staffId: staff.id, documentId: document.id, fileName: document.fileName, storage: document.s3Key });
-      return;
-    }
-
-    if (s3 && document.s3Key) {
-      const params = { Bucket: S3_BUCKET, Key: document.s3Key };
-      const s3Object = await s3.send(new GetObjectCommand(params));
+    if (document.s3Key) {
+      const s3Object = await getObjectFromS3(document.s3Key);
       res.setHeader("Content-Type", getDocumentMimeType(document.fileName));
       res.setHeader("Content-Disposition", `attachment; filename="${document.fileName}"`);
       if (!s3Object.Body || typeof s3Object.Body.pipe !== "function") {
@@ -927,20 +892,10 @@ app.delete("/api/staff/:staffId/documents/:docId", authenticateToken, (req, res)
   if (!allowedDelete) return res.status(403).json({ error: "Access denied for this location" });
 
   const doc = (staff.documents || []).find((d) => d.id === req.params.docId);
-  if (doc?.s3Key && s3 && !doc.s3Key.startsWith("local:")) {
-    s3.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: doc.s3Key })).catch((err) => {
+  if (doc?.s3Key) {
+    deleteObjectFromS3(doc.s3Key).catch((err) => {
       console.warn("Failed to delete S3 object during document delete:", err && err.message ? err.message : err);
     });
-  }
-  if (doc?.s3Key && doc.s3Key.startsWith("local:")) {
-    const filePath = doc.s3Key.replace(/^local:/, "");
-    if (fs.existsSync(filePath)) {
-      try {
-        fs.unlinkSync(filePath);
-      } catch (err) {
-        console.warn("Failed to remove local file during document delete:", err && err.message ? err.message : err);
-      }
-    }
   }
   staff.documents = (staff.documents || []).filter((d) => d.id !== req.params.docId);
   res.json({ message: "Document removed" });
