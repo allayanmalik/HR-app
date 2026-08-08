@@ -30,10 +30,10 @@
         { "name": "DB_USER", "value": "postgres" },
         { "name": "DB_NAME", "value": "postgres" }
       ],
-      "secrets": [
-        { "name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:eu-west-2:805982516676:secret:hr-app/db-password-oBknhJ" },
-        { "name": "JWT_SECRET", "valueFrom": "arn:aws:secretsmanager:eu-west-2:805982516676:secret:hr-app/jwt-secret-BTqzKe" },
-        { "name": "ADMIN_PASSWORD", "valueFrom": "arn:aws:secretsmanager:eu-west-2:805982516676:secret:hr-app/admin-password-XVUwJY" }
+     "secrets": [
+      { "name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:eu-west-2:805982516676:secret:hr-app/db-password-oBknhJ:password::" },
+      { "name": "JWT_SECRET", "valueFrom": "arn:aws:secretsmanager:eu-west-2:805982516676:secret:hr-app/jwt-secret-BTqzKe:value::" },
+      { "name": "ADMIN_PASSWORD", "valueFrom": "arn:aws:secretsmanager:eu-west-2:805982516676:secret:hr-app/admin-password-XVUwJY:value::" }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
