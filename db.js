@@ -4,12 +4,17 @@ const DEFAULT_DB_HOST = "hr-portal-db.c5m4oagyag9k.eu-west-2.rds.amazonaws.com";
 const DEFAULT_DB_PORT = 5432;
 const DEFAULT_DB_USER = "postgres";
 const DEFAULT_DB_NAME = "postgres";
+const dbPassword = process.env.DB_PASSWORD;
+
+if (typeof dbPassword !== "string" || dbPassword.length === 0) {
+  throw new Error("DB_PASSWORD must be set to a non-empty string for PostgreSQL connections");
+}
 
 export const dbConfig = {
   host: process.env.DB_HOST || DEFAULT_DB_HOST,
   port: Number(process.env.DB_PORT || DEFAULT_DB_PORT),
   user: process.env.DB_USER || DEFAULT_DB_USER,
-  password: process.env.DB_PASSWORD || "",
+  password: dbPassword,
   database: process.env.DB_NAME || DEFAULT_DB_NAME,
   ssl: { rejectUnauthorized: false }
 };
