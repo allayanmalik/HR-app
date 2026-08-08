@@ -429,5 +429,5 @@ app.post("/api/docusign/webhook", async (req, res) => {
   res.status(200).send("OK");
 });
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 80;
 app.listen(PORT, () => console.log(`Secure HR Portal API running on port ${PORT}`));

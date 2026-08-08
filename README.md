@@ -126,7 +126,7 @@ Runtime app secrets (set in ECS task definition or parameter store):
 - `S3_BUCKET_NAME`
 - SMTP or SES variables
 
-For local development, keep `APP_URL=http://localhost:5173` and `VITE_API_URL=http://localhost:5000/api`.
+For local development, keep `APP_URL=http://localhost:5173` and `VITE_API_URL=http://localhost:80/api`.
 
 ### 4) Deploy
 

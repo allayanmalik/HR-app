@@ -13,8 +13,8 @@
       "essential": true,
       "portMappings": [
         {
-          "containerPort": 5000,
-          "hostPort": 5000,
+          "containerPort": 80,
+          "hostPort": 80,
           "protocol": "tcp"
         }
       ],
@@ -24,7 +24,7 @@
         { "name": "APP_URL", "value": "https://am-service.co.uk" },
         { "name": "ADMIN_EMAIL", "value": "allayanmalik@gmail.com" },
         { "name": "AWS_REGION", "value": "eu-west-2" },
-        { "name": "S3_BUCKET", "value": "hr-app-docs-1892298022" },
+        { "name": "S3_BUCKET_NAME", "value": "hr-app-docs-1892298022" },
         { "name": "DB_HOST", "value": "hr-portal-db.c5m4oagyag9k.eu-west-2.rds.amazonaws.com" },
         { "name": "DB_PORT", "value": "5432" },
         { "name": "DB_USER", "value": "postgres" },

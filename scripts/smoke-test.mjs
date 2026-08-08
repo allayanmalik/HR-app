@@ -3,7 +3,7 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-const API = process.env.SMOKE_API_BASE || process.env.VITE_API_URL || "http://127.0.0.1:5000";
+const API = process.env.SMOKE_API_BASE || process.env.VITE_API_URL || "http://127.0.0.1:80";
 const JWT_SECRET = process.env.JWT_SECRET || "super-secret-production-key-change-me";
 const adminEmail = process.env.ADMIN_EMAIL || "allayanmalik@gmail.com";
 const runId = Date.now();
