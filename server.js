@@ -207,7 +207,8 @@ let db = {
   templates: [],
   instances: [],
   docusignEnvelopes: [],
-  audit: []
+  audit: [],
+  notifications: []
 };
 
 function addAudit(action, user, details = {}) {
@@ -330,6 +331,14 @@ function getDocumentMimeType(fileName = "") {
   return DOCUMENT_MIME_TYPES[ext] || "application/octet-stream";
 }
 
+// Uploaded documents are restricted to PDFs, Word documents, and common image formats
+const ALLOWED_DOCUMENT_EXTENSIONS = new Set(["pdf", "doc", "docx", "png", "jpg", "jpeg", "gif", "webp", "heic"]);
+
+function isAllowedDocumentFile(fileName = "") {
+  const ext = (fileName.split(".").pop() || "").toLowerCase();
+  return ALLOWED_DOCUMENT_EXTENSIONS.has(ext);
+}
+
 function getAppBaseUrl() {
   return process.env.APP_URL || (process.env.NODE_ENV === "production" ? "https://am-service.co.uk" : "http://localhost:5173");
 }
@@ -373,8 +382,15 @@ function normalizeRtw(rtw = {}) {
     verificationNotes: rtw.verificationNotes || "",
     noTimeLimit: Boolean(rtw.noTimeLimit),
     // Tracks the expiryDate value we last sent notifications for, so we never email twice for the same date
-    expiryNotifiedForDate: rtw.expiryNotifiedForDate || null
+    expiryNotifiedForDate: rtw.expiryNotifiedForDate || null,
+    // Tracks the calendar day (YYYY-MM-DD) we last sent an urgent "already expired" reminder, so it fires once per day
+    lastExpiredReminderDate: rtw.lastExpiredReminderDate || null
   };
+}
+
+function normalizeNotifyEmails(value) {
+  if (!Array.isArray(value)) return [];
+  return Array.from(new Set(value.map((e) => String(e || "").trim().toLowerCase()).filter(Boolean)));
 }
 
 function normalizeAddress(address = {}) {
@@ -530,8 +546,106 @@ async function sendNotificationEmail(to, subject, text) {
   throw new Error("No SMTP/SES transporter configured and DEV_EMAIL_TO_CONSOLE is not enabled");
 }
 
+// Combines the global admin(s), subadmins with access to this site, and any extra
+// notify-only email addresses configured on the site (no account, CC-style recipients)
+function getSiteAdminRecipients(siteId) {
+  const emails = new Set();
+  for (const u of db.users) {
+    if (u.role === "admin") emails.add(u.email.toLowerCase());
+    else if (u.role === "subadmin" && siteId && (u.siteAccess || []).includes(siteId)) emails.add(u.email.toLowerCase());
+  }
+  if (siteId) {
+    const site = db.sites.find((s) => s.id === siteId);
+    normalizeNotifyEmails(site?.notifyEmails).forEach((e) => emails.add(e));
+  }
+  return Array.from(emails);
+}
+
+function notifyRecipients(recipients, subject, text) {
+  for (const email of recipients) {
+    sendNotificationEmail(email, subject, text).catch((err) => {
+      console.warn(`Notification email failed for ${email}`, err && err.message ? err.message : err);
+    });
+  }
+}
+
+function addNotification({ type, siteId = null, staffId = null, staffName = "", message, severity = "info" }) {
+  db.notifications = db.notifications || [];
+  const entry = {
+    id: `notif-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    type,
+    siteId,
+    staffId,
+    staffName,
+    message,
+    severity,
+    createdAt: new Date().toISOString()
+  };
+  db.notifications.unshift(entry);
+  db.notifications = db.notifications.slice(0, 500);
+  return entry;
+}
+
+function getEventNotificationsForUser(user) {
+  const all = db.notifications || [];
+  if (user.role === "admin") return all;
+  if (user.role === "subadmin") return all.filter((n) => !n.siteId || (user.siteAccess || []).includes(n.siteId));
+  if (user.role === "staff") return all.filter((n) => n.staffId === user.staffId);
+  return [];
+}
+
+// Right-to-work notifications reflect current live state (they disappear once resolved),
+// unlike the persisted event notifications above.
+function getRtwNotificationItems(user) {
+  const visibleStaff = user.role === "admin" ? db.staff
+    : user.role === "subadmin" ? db.staff.filter((s) => (user.siteAccess || []).includes(s.siteId))
+    : user.role === "staff" ? db.staff.filter((s) => s.id === user.staffId)
+    : [];
+
+  const items = [];
+  for (const staff of visibleStaff) {
+    const rtw = staff.rtw;
+    if (!rtw || rtw.checkType === "not-required" || rtw.noTimeLimit || !rtw.expiryDate) continue;
+    const days = daysUntil(rtw.expiryDate);
+    if (days === null) continue;
+
+    const site = db.sites.find((s) => s.id === staff.siteId);
+    const noticeDaysRaw = Number(site?.rtwNoticeDays);
+    const noticeDays = Number.isFinite(noticeDaysRaw) && noticeDaysRaw > 0 ? noticeDaysRaw : 90;
+    if (days > noticeDays) continue;
+
+    const fullName = `${staff.firstName} ${staff.lastName}`.trim();
+    if (days < 0) {
+      items.push({
+        id: `rtw-expired-${staff.id}`,
+        type: "rtw_expired",
+        severity: "bad",
+        siteId: staff.siteId,
+        staffId: staff.id,
+        staffName: fullName,
+        message: `${fullName}'s right to work expired on ${fmtDateForEmail(rtw.expiryDate)}. Urgent action required.`,
+        createdAt: new Date(`${rtw.expiryDate}T00:00:00Z`).toISOString()
+      });
+    } else {
+      items.push({
+        id: `rtw-expiring-${staff.id}`,
+        type: "rtw_expiring",
+        severity: "warn",
+        siteId: staff.siteId,
+        staffId: staff.id,
+        staffName: fullName,
+        message: `${fullName}'s right to work expires on ${fmtDateForEmail(rtw.expiryDate)} (${days}d left).`,
+        createdAt: new Date(`${rtw.expiryDate}T00:00:00Z`).toISOString()
+      });
+    }
+  }
+  return items;
+}
+
 async function runRtwExpiryCheck() {
   let changed = false;
+  const todayStr = new Date().toISOString().slice(0, 10);
+
   for (const staff of db.staff) {
     const rtw = staff.rtw;
     if (!rtw || rtw.checkType === "not-required" || rtw.noTimeLimit || !rtw.expiryDate) continue;
@@ -542,23 +656,57 @@ async function runRtwExpiryCheck() {
     const site = db.sites.find((s) => s.id === staff.siteId);
     const noticeDaysRaw = Number(site?.rtwNoticeDays);
     const noticeDays = Number.isFinite(noticeDaysRaw) && noticeDaysRaw > 0 ? noticeDaysRaw : 90;
-
     if (days > noticeDays) continue; // Not within the notice window yet
-    if (rtw.expiryNotifiedForDate === rtw.expiryDate) continue; // Already notified for this expiry date
 
     const fullName = `${staff.firstName} ${staff.lastName}`.trim();
-    const recipients = db.users.filter((u) => u.role === "admin" || (u.role === "subadmin" && (u.siteAccess || []).includes(staff.siteId)));
+    const recipients = getSiteAdminRecipients(staff.siteId);
     const staffUser = db.users.find((u) => u.staffId === staff.id);
 
-    for (const admin of recipients) {
+    if (days < 0) {
+      // Already expired: send an urgent reminder every day until it's resolved
+      if (rtw.lastExpiredReminderDate === todayStr) continue;
+
+      for (const email of recipients) {
+        try {
+          await sendNotificationEmail(
+            email,
+            `URGENT: Right to work expired \u2013 ${fullName}`,
+            `${fullName}'s right to work expired on ${fmtDateForEmail(rtw.expiryDate)} and has not yet been renewed. Please action this urgently.`
+          );
+        } catch (err) {
+          console.warn(`RTW expired admin email failed for ${email}`, err && err.message ? err.message : err);
+        }
+      }
+
+      if (staffUser) {
+        try {
+          await sendNotificationEmail(
+            staffUser.email,
+            "Urgent: your right to work has expired",
+            `Your right to work expired on ${fmtDateForEmail(rtw.expiryDate)}. Please provide updated right to work details in the AM Service HR Portal as soon as possible, or contact your manager or HR.`
+          );
+        } catch (err) {
+          console.warn(`RTW expired staff email failed for ${staffUser.email}`, err && err.message ? err.message : err);
+        }
+      }
+
+      rtw.lastExpiredReminderDate = todayStr;
+      changed = true;
+      continue;
+    }
+
+    // Expiring soon (not yet expired): one-time notice for this specific expiry date
+    if (rtw.expiryNotifiedForDate === rtw.expiryDate) continue;
+
+    for (const email of recipients) {
       try {
         await sendNotificationEmail(
-          admin.email,
+          email,
           `Right to work expiring: ${fullName}`,
           `${fullName}'s right to work is expiring on ${fmtDateForEmail(rtw.expiryDate)}. Please review their right to work details in the AM Service HR Portal.`
         );
       } catch (err) {
-        console.warn(`RTW expiry admin email failed for ${admin.email}`, err && err.message ? err.message : err);
+        console.warn(`RTW expiry admin email failed for ${email}`, err && err.message ? err.message : err);
       }
     }
 
@@ -750,6 +898,15 @@ function withDocumentMeta(staffMember) {
   };
 }
 
+// Notification centre: live right-to-work items plus the persisted event feed (contract signed,
+// document uploaded, staff details updated), scoped to what the current user is allowed to see.
+app.get("/api/notifications", authenticateToken, (req, res) => {
+  const rtwItems = getRtwNotificationItems(req.user);
+  const eventItems = getEventNotificationsForUser(req.user);
+  const notifications = [...rtwItems, ...eventItems].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  res.json({ notifications });
+});
+
 app.get("/api/directory", authenticateToken, (req, res) => {
   if (isAdminLike(req.user)) {
     const visibleSiteIds = getVisibleSiteIds(req.user);
@@ -910,22 +1067,18 @@ app.post("/api/staff", authenticateToken, async (req, res) => {
   const cleanLastName = (lastName || "").trim();
   const cleanEmail = (email || "").trim().toLowerCase();
 
-  // Only name and email are mandatory. Business admins may fill in everything else,
+  // Name, email, and business/location are mandatory. Business admins may fill in everything else,
   // and the invited staff member can add or correct any remaining details themselves.
-  if (!cleanFirstName || !cleanLastName || !cleanEmail) {
-    return res.status(400).json({ error: "First name, last name, and email are required" });
+  if (!cleanFirstName || !cleanLastName || !cleanEmail || !siteId) {
+    return res.status(400).json({ error: "First name, last name, email, and business/location are required" });
   }
 
   if (db.users.some((u) => u.email.toLowerCase() === cleanEmail)) {
     return res.status(409).json({ error: "An account with that email already exists" });
   }
 
-  if (siteId) {
-    if (!isAdminLike(req.user) && !canManageSite(req.user, siteId)) {
-      return res.status(403).json({ error: "Access denied for this location" });
-    }
-  } else if (req.user.role !== "admin") {
-    return res.status(400).json({ error: "A business/location is required unless you are a global admin" });
+  if (!isAdminLike(req.user) && !canManageSite(req.user, siteId)) {
+    return res.status(403).json({ error: "Access denied for this location" });
   }
 
   const normalizedRtw = normalizeRtw(rtw);
@@ -944,7 +1097,7 @@ app.post("/api/staff", authenticateToken, async (req, res) => {
     email: cleanEmail,
     phone: phone || "",
     niNumber: niNumber || "",
-    siteId: siteId || null,
+    siteId,
     jobTitle: jobTitle || "",
     startDate: startDate || "",
     dateOfBirth: dateOfBirth || "",
@@ -1066,6 +1219,24 @@ app.put("/api/staff/:id", authenticateToken, (req, res) => {
 
   res.json(updatedStaff);
   addAudit("staff_updated", req.user, { staffId: req.params.id, updatedFields: Object.keys(incoming), self: isSelf });
+
+  if (isSelf) {
+    const fullName = `${updatedStaff.firstName} ${updatedStaff.lastName}`.trim();
+    addNotification({
+      type: "staff_updated",
+      siteId: updatedStaff.siteId,
+      staffId: updatedStaff.id,
+      staffName: fullName,
+      message: `${fullName} updated their personal details.`,
+      severity: "info"
+    });
+    notifyRecipients(
+      getSiteAdminRecipients(updatedStaff.siteId),
+      `Staff details updated: ${fullName}`,
+      `${fullName} has updated their personal details in the AM Service HR Portal. Please review their record if needed.`
+    );
+  }
+
   saveDbToDisk();
 });
 
@@ -1140,6 +1311,9 @@ app.post("/api/staff/:id/documents", authenticateToken, documentUpload.single("f
   if (!fileName || (!documentBase64 && !req.file)) {
     return res.status(400).json({ error: "A file name and file content are required" });
   }
+  if (!isAllowedDocumentFile(fileName)) {
+    return res.status(400).json({ error: "Unsupported file type. Only PDF, Word documents (doc/docx), and images (png, jpg, gif, webp, heic) are allowed." });
+  }
 
   const id = "doc-" + Date.now();
   const record = {
@@ -1170,6 +1344,24 @@ app.post("/api/staff/:id/documents", authenticateToken, documentUpload.single("f
   const { s3Key, ...meta } = record;
   res.status(201).json(meta);
   addAudit("staff_document_uploaded", req.user, { staffId: staff.id, documentId: record.id, fileName: record.fileName, storage: record.s3Key });
+
+  if (req.user.staffId === staff.id) {
+    const fullName = `${staff.firstName} ${staff.lastName}`.trim();
+    addNotification({
+      type: "document_uploaded",
+      siteId: staff.siteId,
+      staffId: staff.id,
+      staffName: fullName,
+      message: `${fullName} uploaded a document: ${record.title}.`,
+      severity: "info"
+    });
+    notifyRecipients(
+      getSiteAdminRecipients(staff.siteId),
+      `Document uploaded: ${fullName}`,
+      `${fullName} uploaded a new document (${record.title}) in the AM Service HR Portal.`
+    );
+  }
+
   saveDbToDisk();
 });
 
@@ -1239,7 +1431,8 @@ app.post("/api/sites", authenticateToken, requireAdmin, (req, res) => {
   const assignedAdminIds = Array.isArray(req.body.assignedAdminIds) ? req.body.assignedAdminIds : [];
   const rtwNoticeDaysRaw = Number(req.body.rtwNoticeDays);
   const rtwNoticeDays = Number.isFinite(rtwNoticeDaysRaw) && rtwNoticeDaysRaw > 0 ? Math.round(rtwNoticeDaysRaw) : 90;
-  const site = { id: "site-" + Date.now(), ...req.body, assignedAdminIds, rtwNoticeDays };
+  const notifyEmails = normalizeNotifyEmails(req.body.notifyEmails);
+  const site = { id: "site-" + Date.now(), ...req.body, assignedAdminIds, rtwNoticeDays, notifyEmails };
   db.sites.push(site);
 
   assignedAdminIds.forEach((adminId) => {
@@ -1259,13 +1452,16 @@ app.put("/api/sites/:id", authenticateToken, (req, res) => {
   if (index === -1) return res.status(404).json({ error: "Business not found" });
   if (!canManageSite(req.user, req.params.id)) return res.status(403).json({ error: "Access denied for this location" });
 
-  const { name, address, rtwNoticeDays, assignedAdminIds } = req.body;
+  const { name, address, rtwNoticeDays, assignedAdminIds, notifyEmails } = req.body;
   const updated = { ...db.sites[index] };
   if (typeof name === "string" && name.trim()) updated.name = name.trim();
   if (typeof address === "string") updated.address = address;
   if (rtwNoticeDays !== undefined) {
     const days = Number(rtwNoticeDays);
     updated.rtwNoticeDays = Number.isFinite(days) && days > 0 ? Math.round(days) : (updated.rtwNoticeDays || 90);
+  }
+  if (notifyEmails !== undefined) {
+    updated.notifyEmails = normalizeNotifyEmails(notifyEmails);
   }
   if (Array.isArray(assignedAdminIds) && isAdminLike(req.user)) {
     updated.assignedAdminIds = assignedAdminIds;
@@ -1280,6 +1476,173 @@ app.put("/api/sites/:id", authenticateToken, (req, res) => {
 app.delete("/api/sites/:id", authenticateToken, requireAdmin, (req, res) => {
   db.sites = db.sites.filter((s) => s.id !== req.params.id);
   res.json({ message: "Site removed" });
+  saveDbToDisk();
+});
+
+const STAFF_CSV_COLUMNS = [
+  "firstName", "lastName", "email", "phone", "niNumber", "jobTitle", "startDate", "dateOfBirth",
+  "addressLine1", "addressLine2", "city", "postcode",
+  "bankAccountNumber", "bankSortCode",
+  "rtwNationalityType", "rtwShareCode", "rtwExpiryDate", "rtwManualDetails"
+];
+
+function csvEscape(value) {
+  const str = value === undefined || value === null ? "" : String(value);
+  if (/[",\n]/.test(str)) return `"${str.replace(/"/g, '""')}"`;
+  return str;
+}
+
+function staffToCsvRow(staff) {
+  return [
+    staff.firstName, staff.lastName, staff.email, staff.phone, staff.niNumber, staff.jobTitle, staff.startDate, staff.dateOfBirth,
+    staff.address?.line1, staff.address?.line2, staff.address?.city, staff.address?.postcode,
+    staff.bankAccountNumber, staff.bankSortCode,
+    staff.rtw?.nationalityType, staff.rtw?.shareCode, staff.rtw?.expiryDate, staff.rtw?.manualDetails
+  ].map(csvEscape).join(",");
+}
+
+// Minimal RFC 4180 CSV parser (handles quoted fields containing commas/newlines/escaped quotes)
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (inQuotes) {
+      if (char === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else {
+        field += char;
+      }
+    } else if (char === '"') {
+      inQuotes = true;
+    } else if (char === ",") {
+      row.push(field);
+      field = "";
+    } else if (char === "\n") {
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+    } else if (char === "\r") {
+      // ignore, newline is handled by the following \n
+    } else {
+      field += char;
+    }
+  }
+  if (field.length > 0 || row.length > 0) {
+    row.push(field);
+    rows.push(row);
+  }
+  return rows.filter((r) => r.some((cell) => String(cell || "").trim() !== ""));
+}
+
+// Export every staff member for a business as a CSV file
+app.get("/api/sites/:id/staff/export", authenticateToken, (req, res) => {
+  const site = db.sites.find((s) => s.id === req.params.id);
+  if (!site) return res.status(404).json({ error: "Business not found" });
+  if (!canManageSite(req.user, site.id)) return res.status(403).json({ error: "Access denied for this location" });
+
+  const rows = db.staff.filter((s) => s.siteId === site.id);
+  const csvLines = [STAFF_CSV_COLUMNS.join(","), ...rows.map(staffToCsvRow)];
+  const csv = csvLines.join("\r\n");
+
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", `attachment; filename="${site.name.replace(/[^a-z0-9]+/gi, "_")}-staff.csv"`);
+  res.send(csv);
+  addAudit("staff_csv_exported", req.user, { siteId: site.id, count: rows.length });
+});
+
+// Bulk-import staff into a business from a CSV file (header row required, matching the export columns)
+app.post("/api/sites/:id/staff/import", authenticateToken, async (req, res) => {
+  const site = db.sites.find((s) => s.id === req.params.id);
+  if (!site) return res.status(404).json({ error: "Business not found" });
+  if (!canManageSite(req.user, site.id)) return res.status(403).json({ error: "Access denied for this location" });
+
+  const csvText = req.body.csv;
+  if (!csvText || typeof csvText !== "string") return res.status(400).json({ error: "CSV text is required" });
+
+  const rows = parseCsv(csvText.trim());
+  if (rows.length < 2) return res.status(400).json({ error: "CSV must include a header row and at least one data row" });
+
+  const header = rows[0].map((h) => h.trim());
+  const dataRows = rows.slice(1);
+  const created = [];
+  const skipped = [];
+
+  for (const row of dataRows) {
+    const record = {};
+    header.forEach((col, idx) => { record[col] = (row[idx] || "").trim(); });
+
+    const firstName = record.firstName || "";
+    const lastName = record.lastName || "";
+    const email = (record.email || "").trim().toLowerCase();
+
+    if (!firstName || !lastName || !email) {
+      skipped.push({ row: record, reason: "Missing first name, last name, or email" });
+      continue;
+    }
+    if (db.users.some((u) => u.email.toLowerCase() === email)) {
+      skipped.push({ row: record, reason: "An account with that email already exists" });
+      continue;
+    }
+
+    const newStaffId = `staff-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const newStaff = {
+      id: newStaffId,
+      firstName,
+      lastName,
+      email,
+      phone: record.phone || "",
+      niNumber: record.niNumber || "",
+      siteId: site.id,
+      jobTitle: record.jobTitle || "",
+      startDate: record.startDate || "",
+      dateOfBirth: record.dateOfBirth || "",
+      address: normalizeAddress({ line1: record.addressLine1, line2: record.addressLine2, city: record.city, postcode: record.postcode }),
+      bankAccountNumber: (record.bankAccountNumber || "").replace(/\s+/g, ""),
+      bankSortCode: normalizeSortCode(record.bankSortCode),
+      training: [],
+      documents: [],
+      rtw: normalizeRtw({
+        nationalityType: record.rtwNationalityType || "british-irish",
+        shareCode: record.rtwShareCode || "",
+        expiryDate: record.rtwExpiryDate || "",
+        manualDetails: record.rtwManualDetails || ""
+      })
+    };
+
+    const newUser = {
+      id: `user-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      email,
+      passwordHash: null,
+      role: "staff",
+      staffId: newStaffId,
+      mustSetPassword: true,
+      inviteType: "staff"
+    };
+
+    db.staff.push(newStaff);
+    db.users.push(newUser);
+    created.push({ id: newStaffId, email });
+
+    try {
+      await sendInviteEmail(
+        newUser,
+        "Set up your password",
+        (inviteLink) => `Welcome ${firstName}. AM Service HR Portal has invited you on behalf of ${site.name}. This account lets you access only your own documents and contracts, and you can add or correct your own personal details once you sign in. Please create your password here: ${inviteLink}`,
+        "staff"
+      );
+    } catch (err) {
+      console.warn(`Invite email failed for imported staff ${email}`, err && err.message ? err.message : err);
+    }
+  }
+
+  res.json({ message: `Imported ${created.length} staff member(s), skipped ${skipped.length}`, created, skipped });
+  addAudit("staff_csv_imported", req.user, { siteId: site.id, created: created.length, skipped: skipped.length });
   saveDbToDisk();
 });
 
@@ -1470,7 +1833,24 @@ app.post("/api/contracts/:id/sign", authenticateToken, async (req, res) => {
   };
   contract.body = `${contract.body}\n\nSigned by ${req.body.typedName || "the recipient"}`;
   addAudit("contract_signed", req.user, { contractId: contract.id, staffId: contract.staffId, typedName: contract.signatureDetails.typedName });
+
+  const signerFullName = staff ? `${staff.firstName} ${staff.lastName}`.trim() : (contract.staffName || "A staff member");
+  addNotification({
+    type: "contract_signed",
+    siteId: staff?.siteId || null,
+    staffId: contract.staffId,
+    staffName: signerFullName,
+    message: `${signerFullName} signed the contract "${contract.templateTitle || contract.title}".`,
+    severity: "info"
+  });
+  notifyRecipients(
+    getSiteAdminRecipients(staff?.siteId || null),
+    `Contract signed: ${signerFullName}`,
+    `${signerFullName} has signed the contract "${contract.templateTitle || contract.title}" in the AM Service HR Portal.`
+  );
+
   res.json(contract);
+  saveDbToDisk();
 });
 
 app.get("/api/contracts/:id/download", authenticateToken, (req, res) => {
@@ -1508,6 +1888,16 @@ app.post("/api/docusign/create-recipient-view", authenticateToken, async (req, r
 
 app.post("/api/docusign/webhook", async (req, res) => {
   res.json({ ok: true });
+});
+
+// Central error handler: turns multer/file-filter errors (and any other thrown errors) into JSON
+// instead of Express's default HTML error page.
+app.use((err, req, res, next) => {
+  if (!err) return next();
+  console.error("Unhandled request error:", err && err.message ? err.message : err);
+  if (res.headersSent) return next(err);
+  const status = err.status || err.statusCode || 400;
+  res.status(status).json({ error: err.message || "Request could not be processed" });
 });
 
 const PORT = process.env.PORT || 80;

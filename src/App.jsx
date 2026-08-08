@@ -118,11 +118,12 @@ const btnPrimary = "rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text
 const btnSecondary = "rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50";
 const btnDanger = "rounded-lg border border-rose-200 bg-white px-4 py-2 text-sm font-semibold text-rose-600 hover:bg-rose-50";
 
-function Field({ label, children, className = "" }) {
+function Field({ label, children, className = "", required = false, error = "" }) {
   return (
     <div className={`mb-3 ${className}`.trim()}>
-      <label className={labelCls}>{label}</label>
+      <label className={labelCls}>{label}{required && <span className="ml-0.5 text-rose-500">*</span>}</label>
       {children}
+      {error && <p className="mt-1 text-xs font-medium text-rose-600">{error}</p>}
     </div>
   );
 }
@@ -398,6 +399,7 @@ export default function App() {
   const [dir, setDir] = useState({ sites: [], staff: [] });
   const [contracts, setContracts] = useState({ templates: [], instances: [] });
   const [adminUsers, setAdminUsers] = useState([]);
+  const [notifications, setNotifications] = useState([]);
   const [tab, setTab] = useState("dashboard");
   const [staffTab, setStaffTab] = useState("my-details");
   const [contractsSubTab, setContractsSubTab] = useState("templates");
@@ -425,11 +427,12 @@ export default function App() {
 
   const loadData = async (user = currentUser) => {
     try {
-      const requests = [apiFetch("/directory"), apiFetch("/contracts")];
+      const requests = [apiFetch("/directory"), apiFetch("/contracts"), apiFetch("/notifications")];
       if (user?.role === "admin") requests.push(apiFetch("/admin-users"));
-      const [dirRes, contractRes, adminUsersRes] = await Promise.all(requests);
+      const [dirRes, contractRes, notificationsRes, adminUsersRes] = await Promise.all(requests);
       setDir(dirRes);
       setContracts(contractRes);
+      setNotifications(notificationsRes?.notifications || []);
       if (adminUsersRes) setAdminUsers(adminUsersRes.users || []);
       else setAdminUsers([]);
     } catch (err) {
@@ -534,6 +537,20 @@ export default function App() {
 
   const downloadDocument = (staffId, docId) => {
     window.open(`${API_BASE}/staff/${staffId}/documents/${docId}/download`, "_blank");
+  };
+
+  const exportStaffCsv = (siteId) => {
+    window.open(`${API_BASE}/sites/${siteId}/staff/export`, "_blank");
+  };
+
+  const importStaffCsv = async (siteId, csvText) => {
+    try {
+      const result = await apiFetch(`/sites/${siteId}/staff/import`, "POST", { csv: csvText });
+      await loadData();
+      showToast(result.message || "CSV import complete");
+    } catch (err) {
+      showToast(err.message);
+    }
   };
 
   const saveSite = async (siteData) => {
@@ -665,6 +682,7 @@ export default function App() {
           {hasAdminAccess ? (
             <>
               <NavBtn active={tab === "dashboard"} onClick={() => setTab("dashboard")} icon={LayoutDashboard} label="Dashboard" />
+              <NavBtn active={tab === "notifications"} onClick={() => setTab("notifications")} icon={Bell} label="Notifications" badge={notifications.length || undefined} />
               <NavBtn active={tab === "staff"} onClick={() => setTab("staff")} icon={Users} label="Staff" />
               <NavBtn active={tab === "rtw"} onClick={() => setTab("rtw")} icon={ShieldCheck} label="Right to work" />
               <NavBtn active={tab === "training"} onClick={() => setTab("training")} icon={GraduationCap} label="Training" />
@@ -675,6 +693,7 @@ export default function App() {
           ) : (
             <>
               <NavBtn active={staffTab === "my-details"} onClick={() => setStaffTab("my-details")} icon={Users} label="My details" />
+              <NavBtn active={staffTab === "notifications"} onClick={() => setStaffTab("notifications")} icon={Bell} label="Notifications" badge={notifications.length || undefined} />
               <NavBtn active={staffTab === "my-training"} onClick={() => setStaffTab("my-training")} icon={GraduationCap} label="My training" />
               <NavBtn active={staffTab === "my-contracts"} onClick={() => setStaffTab("my-contracts")} icon={FileText} label="My contracts" />
               <NavBtn active={staffTab === "my-documents"} onClick={() => setStaffTab("my-documents")} icon={Paperclip} label="My documents" />
@@ -685,6 +704,7 @@ export default function App() {
 
       <main className="mx-auto max-w-5xl px-4 py-6">
         {hasAdminAccess && tab === "dashboard" && <Dashboard dir={dir} contracts={contracts} goTab={setTab} />}
+        {hasAdminAccess && tab === "notifications" && <NotificationsTab notifications={notifications} />}
         {hasAdminAccess && tab === "staff" && (
           <StaffTab
             dir={dir}
@@ -692,6 +712,8 @@ export default function App() {
             onEdit={(id) => setStaffModal(id)}
             onDelete={(s) => setConfirmDelete({ type: "staff", id: s.id, label: `${s.firstName} ${s.lastName}` })}
             onResendInvite={(id) => resendStaffInvite(id)}
+            onExportCsv={exportStaffCsv}
+            onImportCsv={importStaffCsv}
           />
         )}
         {hasAdminAccess && tab === "rtw" && <RtwTab dir={dir} onVerify={(id) => setVerifyStaffId(id)} />}
@@ -738,6 +760,7 @@ export default function App() {
         {currentUser.role === "staff" && staffMember && staffTab === "my-details" && (
           <MyDetails staff={staffMember} site={dir.sites.find((s) => s.id === staffMember.siteId)} onSave={saveMyDetails} />
         )}
+        {currentUser.role === "staff" && staffMember && staffTab === "notifications" && <NotificationsTab notifications={notifications} />}
         {currentUser.role === "staff" && staffMember && staffTab === "my-training" && <MyTraining staff={staffMember} />}
         {currentUser.role === "staff" && staffMember && staffTab === "my-contracts" && (
           <MyContracts staff={staffMember} contracts={contracts} onSign={(id) => setSignModal(id)} onView={(id) => setViewContractId(id)} />
@@ -804,10 +827,11 @@ export default function App() {
 }
 
 /* Nav & Subviews */
-function NavBtn({ active, onClick, icon: Icon, label }) {
+function NavBtn({ active, onClick, icon: Icon, label, badge }) {
   return (
     <button onClick={onClick} className={`flex shrink-0 items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition ${active ? "bg-slate-900 text-white" : "text-slate-500 hover:bg-slate-100"}`}>
       <Icon size={15} /> {label}
+      {badge ? <span className={`ml-0.5 rounded-full px-1.5 text-[10px] font-bold ${active ? "bg-white text-slate-900" : "bg-rose-500 text-white"}`}>{badge}</span> : null}
     </button>
   );
 }
@@ -884,17 +908,72 @@ function Panel({ title, onSeeAll, children }) {
   );
 }
 
-function StaffTab({ dir, onAdd, onEdit, onDelete, onResendInvite }) {
+const NOTIFICATION_ICONS = {
+  rtw_expired: AlertTriangle,
+  rtw_expiring: AlertTriangle,
+  contract_signed: FileText,
+  document_uploaded: Paperclip,
+  staff_updated: Users
+};
+
+function NotificationsTab({ notifications }) {
+  if (!notifications || notifications.length === 0) {
+    return (
+      <EmptyState
+        icon={Bell}
+        title="No notifications"
+        body="You're all caught up. Right to work alerts, signed contracts, uploaded documents, and staff detail updates will show up here."
+      />
+    );
+  }
+
+  return (
+    <ul className="space-y-2">
+      {notifications.map((n) => {
+        const Icon = NOTIFICATION_ICONS[n.type] || Bell;
+        return (
+          <li key={n.id} className="flex items-start gap-3 rounded-xl border border-slate-200 bg-white p-3.5 shadow-sm">
+            <Icon size={16} className={`mt-0.5 shrink-0 ${n.severity === "bad" ? "text-rose-500" : n.severity === "warn" ? "text-amber-500" : "text-slate-400"}`} />
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-medium text-slate-800">{n.message}</p>
+              <p className="mt-1 text-xs text-slate-400">{fmtDateTime(n.createdAt)}</p>
+            </div>
+            <Badge tone={n.severity === "bad" ? "bad" : n.severity === "warn" ? "warn" : "neutral"}>{n.type.replace(/_/g, " ")}</Badge>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+function StaffTab({ dir, onAdd, onEdit, onDelete, onResendInvite, onExportCsv, onImportCsv }) {
   const [now, setNow] = useState(Date.now());
+  const [csvSiteId, setCsvSiteId] = useState(dir.sites[0]?.id || "");
+  const fileInputRef = useRef(null);
 
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, []);
 
+  const handleImportFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file || !csvSiteId) return;
+    const reader = new FileReader();
+    reader.onload = () => onImportCsv(csvSiteId, String(reader.result || ""));
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
   return (
     <div className="space-y-4">
-      <div className="flex justify-end gap-2">
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        <select className={`${inputCls} w-auto`} value={csvSiteId} onChange={(e) => setCsvSiteId(e.target.value)}>
+          {dir.sites.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+        </select>
+        <button onClick={() => csvSiteId && onExportCsv(csvSiteId)} disabled={!csvSiteId} className={`${btnSecondary} flex items-center gap-1.5 text-xs disabled:cursor-not-allowed disabled:opacity-60`}><Download size={14} /> Export CSV</button>
+        <button onClick={() => fileInputRef.current?.click()} disabled={!csvSiteId} className={`${btnSecondary} flex items-center gap-1.5 text-xs disabled:cursor-not-allowed disabled:opacity-60`}><Upload size={14} /> Import CSV</button>
+        <input ref={fileInputRef} type="file" accept=".csv,text/csv" className="hidden" onChange={handleImportFile} />
         <button onClick={onAdd} className={`${btnPrimary} flex items-center gap-1.5`}><Plus size={15} /> Add staff</button>
       </div>
       <ul className="space-y-2">
@@ -967,17 +1046,17 @@ function StaffModal({ initial, sites, onClose, onSave }) {
 
   return (
     <Modal title={initial ? "Edit Staff" : "Add Staff"} onClose={onClose} wide>
-      <p className="mb-3 text-xs text-slate-500">Only first name, last name, and email are required. Everything else is optional here — the staff member can add or correct these details themselves after accepting their invitation.</p>
+      <p className="mb-3 text-xs text-slate-500">Fields marked <span className="font-semibold text-rose-500">*</span> are required. Everything else can be added or corrected later — either by you, or by the staff member themselves after accepting their invitation.</p>
       <div className="grid gap-3 sm:grid-cols-2">
-        <Field label="First Name *"><input className={inputCls} value={form.firstName} onChange={(e) => setForm({ ...form, firstName: e.target.value })} /></Field>
-        <Field label="Last Name *"><input className={inputCls} value={form.lastName} onChange={(e) => setForm({ ...form, lastName: e.target.value })} /></Field>
-        <Field label="Email *"><input className={inputCls} value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} /></Field>
+        <Field label="First Name" required error={errors.firstName}><input className={inputCls} value={form.firstName} onChange={(e) => setForm({ ...form, firstName: e.target.value })} /></Field>
+        <Field label="Last Name" required error={errors.lastName}><input className={inputCls} value={form.lastName} onChange={(e) => setForm({ ...form, lastName: e.target.value })} /></Field>
+        <Field label="Email" required error={errors.email}><input className={inputCls} value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} /></Field>
         <Field label="Phone"><input className={inputCls} value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} /></Field>
         <Field label="Date of Birth"><input type="date" className={inputCls} value={form.dateOfBirth || ""} onChange={(e) => setForm({ ...form, dateOfBirth: e.target.value })} /></Field>
         <Field label="NI Number"><input className={inputCls} value={form.niNumber} onChange={(e) => setForm({ ...form, niNumber: e.target.value.toUpperCase() })} /></Field>
-        <Field label="Business">
+        <Field label="Business" required error={errors.siteId}>
           <select className={inputCls} value={form.siteId} onChange={(e) => setForm({ ...form, siteId: e.target.value })}>
-            <option value="">Unassigned (global admin only)</option>
+            <option value="">Select a business...</option>
             {sites.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
         </Field>
@@ -1000,7 +1079,7 @@ function StaffModal({ initial, sites, onClose, onSave }) {
       </div>
       {rtwRequired && (
         <div className="mt-3 grid gap-3 sm:grid-cols-2">
-          <Field label="Right to Work Code / Share Code"><input className={inputCls} value={form.rtw?.shareCode || ""} onChange={(e) => setForm({ ...form, rtw: { ...(form.rtw || {}), shareCode: e.target.value } })} /></Field>
+          <Field label="Right to Work Code / Share Code" required={rtwRequired} error={errors.rtwCode}><input className={inputCls} value={form.rtw?.shareCode || ""} onChange={(e) => setForm({ ...form, rtw: { ...(form.rtw || {}), shareCode: e.target.value } })} /></Field>
           <Field label="Right to Work Expires"><input type="date" className={inputCls} value={form.rtw?.expiryDate || ""} onChange={(e) => setForm({ ...form, rtw: { ...(form.rtw || {}), expiryDate: e.target.value } })} /></Field>
           <Field label="Manual Details / Passport Number" className="sm:col-span-2"><textarea className={inputCls} rows={3} value={form.rtw?.manualDetails || ""} onChange={(e) => setForm({ ...form, rtw: { ...(form.rtw || {}), manualDetails: e.target.value } })} /></Field>
         </div>
@@ -1011,15 +1090,17 @@ function StaffModal({ initial, sites, onClose, onSave }) {
         <button className={btnSecondary} onClick={onClose}>Cancel</button>
         <button className={btnPrimary} onClick={() => {
           const newErrors = {};
-          if (!form.firstName) newErrors.firstName = "First name is required";
-          if (!form.lastName) newErrors.lastName = "Last name is required";
-          if (!form.email) newErrors.email = "Email is required";
+          if (!form.firstName.trim()) newErrors.firstName = "First name cannot be left blank";
+          if (!form.lastName.trim()) newErrors.lastName = "Last name cannot be left blank";
+          if (!form.email.trim()) newErrors.email = "Email cannot be left blank";
+          if (!form.siteId) newErrors.siteId = "Business cannot be left blank";
+          if (form.rtw?.nationalityType === "non-british-code" && !form.rtw?.shareCode) newErrors.rtwCode = "Right to work code cannot be left blank";
           setErrors(newErrors);
           if (Object.keys(newErrors).length === 0) onSave(form);
         }}>Save</button>
       </div>
       {Object.keys(errors).length > 0 && (
-        <div className="mt-3 rounded-lg bg-rose-50 p-3 text-sm text-rose-700">{Object.values(errors).map((m) => <div key={m}>{m}</div>)}</div>
+        <div className="mt-3 rounded-lg bg-rose-50 p-3 text-sm text-rose-700">Please fill in all required fields before saving.</div>
       )}
     </Modal>
   );
@@ -1138,7 +1219,24 @@ function DocumentsAdminTab({ dir, onUpload, onDownload, onDelete }) {
 function UploadDocumentModal({ staff, onClose, onSave }) {
   const [title, setTitle] = useState("");
   const [file, setFile] = useState(null);
+  const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const allowedExtensions = ["pdf", "doc", "docx", "png", "jpg", "jpeg", "gif", "webp", "heic"];
+
+  const handleFileChange = (e) => {
+    const selected = e.target.files?.[0] || null;
+    if (selected) {
+      const ext = selected.name.split(".").pop()?.toLowerCase();
+      if (!allowedExtensions.includes(ext)) {
+        setError("Unsupported file type. Only PDF, Word documents, and images are allowed.");
+        setFile(null);
+        e.target.value = "";
+        return;
+      }
+    }
+    setError("");
+    setFile(selected);
+  };
 
   const handleSave = async () => {
     setSubmitting(true);
@@ -1152,7 +1250,10 @@ function UploadDocumentModal({ staff, onClose, onSave }) {
   return (
     <Modal title={`Upload Document: ${staff?.firstName || "Staff"}`} onClose={onClose}>
       <Field label="Document Title (optional)"><input className={inputCls} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. Passport copy" /></Field>
-      <Field label="File"><input type="file" onChange={(e) => setFile(e.target.files?.[0] || null)} /></Field>
+      <Field label="File" error={error}>
+        <input type="file" accept=".pdf,.doc,.docx,.png,.jpg,.jpeg,.gif,.webp,.heic" onChange={handleFileChange} />
+        <p className="mt-1 text-xs text-slate-500">Allowed types: PDF, Word documents (doc/docx), and images (png, jpg, gif, webp, heic).</p>
+      </Field>
       <div className="mt-4 flex justify-end gap-2">
         <button className={btnSecondary} onClick={onClose}>Cancel</button>
         <button className={btnPrimary} disabled={!file || submitting} onClick={handleSave}>{submitting ? "Uploading..." : "Upload"}</button>
@@ -1305,19 +1406,34 @@ function SiteForm({ initial = null, adminUsers, onSave, onCancel }) {
   const [name, setName] = useState(initial?.name || "");
   const [address, setAddress] = useState(initial?.address || "");
   const [rtwNoticeDays, setRtwNoticeDays] = useState(initial?.rtwNoticeDays || 90);
+  const [notifyEmails, setNotifyEmails] = useState((initial?.notifyEmails || []).join("\n"));
   const [selectedAdmins, setSelectedAdmins] = useState(initial?.assignedAdminIds || []);
+  const [errors, setErrors] = useState({});
 
   const toggleAdmin = (adminId) => {
     setSelectedAdmins((current) => current.includes(adminId) ? current.filter((id) => id !== adminId) : [...current, adminId]);
   };
 
+  const handleSave = () => {
+    const newErrors = {};
+    if (!name.trim()) newErrors.name = "Business name cannot be left blank";
+    setErrors(newErrors);
+    if (Object.keys(newErrors).length > 0) return;
+    const emails = notifyEmails.split(/[\n,]/).map((e) => e.trim()).filter(Boolean);
+    onSave({ id: initial?.id, name, address, rtwNoticeDays: Number(rtwNoticeDays) || 90, notifyEmails: emails, assignedAdminIds: selectedAdmins });
+  };
+
   return (
     <div className="space-y-3">
-      <Field label="Name"><input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} /></Field>
+      <Field label="Name" required error={errors.name}><input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} /></Field>
       <Field label="Address"><input className={inputCls} value={address} onChange={(e) => setAddress(e.target.value)} /></Field>
       <Field label="Right to work expiry notice (days before expiry)">
         <input type="number" min={1} className={inputCls} value={rtwNoticeDays} onChange={(e) => setRtwNoticeDays(e.target.value)} />
         <p className="mt-1 text-xs text-slate-500">Business admins and the affected staff member will be emailed and notified on the dashboard this many days before a right to work expiry date.</p>
+      </Field>
+      <Field label="Additional notification-only emails (one per line)">
+        <textarea className={inputCls} rows={3} value={notifyEmails} onChange={(e) => setNotifyEmails(e.target.value)} placeholder="payroll@example.com" />
+        <p className="mt-1 text-xs text-slate-500">These addresses don't get a portal account but will receive emails when: right to work is expiring/expired, a staff member signs a contract, uploads a document, or updates their details.</p>
       </Field>
       <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
         <p className="mb-2 text-sm font-medium text-slate-700">Assign business users</p>
@@ -1332,7 +1448,7 @@ function SiteForm({ initial = null, adminUsers, onSave, onCancel }) {
       </div>
       <div className="mt-3 flex justify-end gap-2">
         <button className={btnSecondary} onClick={onCancel}>Cancel</button>
-        <button className={btnPrimary} onClick={() => onSave({ id: initial?.id, name, address, rtwNoticeDays: Number(rtwNoticeDays) || 90, assignedAdminIds: selectedAdmins })}>Save</button>
+        <button className={btnPrimary} onClick={handleSave}>Save</button>
       </div>
     </div>
   );
@@ -1352,8 +1468,8 @@ function BusinessUserForm({ initial = null, sites = [], onSave, onCancel, onDele
   const handleSave = () => {
     const payload = { name, email, password: password || undefined, siteAccess };
     const newErrors = {};
-    if (!name) newErrors.name = "Name is required";
-    if (!email) newErrors.email = "Email is required";
+    if (!name.trim()) newErrors.name = "Name cannot be left blank";
+    if (!email.trim()) newErrors.email = "Email cannot be left blank";
     setErrors(newErrors);
     if (Object.keys(newErrors).length > 0) return;
     if (initial?.id) payload.id = initial.id;
@@ -1362,8 +1478,8 @@ function BusinessUserForm({ initial = null, sites = [], onSave, onCancel, onDele
 
   return (
     <div className="space-y-3">
-      <Field label="Name"><input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} /></Field>
-      <Field label="Email"><input type="email" className={inputCls} value={email} onChange={(e) => setEmail(e.target.value)} /></Field>
+      <Field label="Name" required error={errors.name}><input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} /></Field>
+      <Field label="Email" required error={errors.email}><input type="email" className={inputCls} value={email} onChange={(e) => setEmail(e.target.value)} /></Field>
       <Field label="Password (optional)"><input type="password" className={inputCls} value={password} onChange={(e) => setPassword(e.target.value)} /></Field>
 
       <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
@@ -1499,9 +1615,9 @@ function MyDetails({ staff, site, onSave }) {
 
   const handleSave = async () => {
     const newErrors = {};
-    if (!form.firstName) newErrors.firstName = "First name is required";
-    if (!form.lastName) newErrors.lastName = "Last name is required";
-    if (!form.email) newErrors.email = "Email is required";
+    if (!String(form.firstName || "").trim()) newErrors.firstName = "First name cannot be left blank";
+    if (!String(form.lastName || "").trim()) newErrors.lastName = "Last name cannot be left blank";
+    if (!String(form.email || "").trim()) newErrors.email = "Email cannot be left blank";
     setErrors(newErrors);
     if (Object.keys(newErrors).length > 0) return;
     setSaving(true);
@@ -1550,9 +1666,9 @@ function MyDetails({ staff, site, onSave }) {
         <p className="text-xs text-slate-500">Correct any incorrect details below.</p>
       </div>
       <div className="grid gap-3 sm:grid-cols-2">
-        <Field label="First Name *"><input className={inputCls} value={form.firstName || ""} onChange={(e) => setForm({ ...form, firstName: e.target.value })} /></Field>
-        <Field label="Last Name *"><input className={inputCls} value={form.lastName || ""} onChange={(e) => setForm({ ...form, lastName: e.target.value })} /></Field>
-        <Field label="Email *"><input className={inputCls} value={form.email || ""} onChange={(e) => setForm({ ...form, email: e.target.value })} /></Field>
+        <Field label="First Name" required error={errors.firstName}><input className={inputCls} value={form.firstName || ""} onChange={(e) => setForm({ ...form, firstName: e.target.value })} /></Field>
+        <Field label="Last Name" required error={errors.lastName}><input className={inputCls} value={form.lastName || ""} onChange={(e) => setForm({ ...form, lastName: e.target.value })} /></Field>
+        <Field label="Email" required error={errors.email}><input className={inputCls} value={form.email || ""} onChange={(e) => setForm({ ...form, email: e.target.value })} /></Field>
         <Field label="Phone"><input className={inputCls} value={form.phone || ""} onChange={(e) => setForm({ ...form, phone: e.target.value })} /></Field>
         <Field label="Date of Birth"><input type="date" className={inputCls} value={form.dateOfBirth || ""} onChange={(e) => setForm({ ...form, dateOfBirth: e.target.value })} /></Field>
         <Field label="NI Number"><input className={inputCls} value={form.niNumber || ""} onChange={(e) => setForm({ ...form, niNumber: e.target.value.toUpperCase() })} /></Field>

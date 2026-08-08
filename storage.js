@@ -14,6 +14,13 @@ function sanitizeFileName(fileName = "document") {
   return fileName.replace(/[^a-zA-Z0-9._-]+/g, "_");
 }
 
+const ALLOWED_UPLOAD_EXTENSIONS = new Set(["pdf", "doc", "docx", "png", "jpg", "jpeg", "gif", "webp", "heic"]);
+
+function isAllowedUploadFile(fileName = "") {
+  const ext = (fileName.split(".").pop() || "").toLowerCase();
+  return ALLOWED_UPLOAD_EXTENSIONS.has(ext);
+}
+
 export function getDocumentUploadMiddleware() {
   return multer({
     storage: multerS3({
@@ -26,6 +33,12 @@ export function getDocumentUploadMiddleware() {
         callback(null, key);
       }
     }),
+    fileFilter(req, file, callback) {
+      if (!isAllowedUploadFile(file.originalname)) {
+        return callback(new Error("Unsupported file type. Only PDF, Word documents (doc/docx), and images (png, jpg, gif, webp, heic) are allowed."));
+      }
+      callback(null, true);
+    },
     limits: { fileSize: 25 * 1024 * 1024 }
   });
 }
