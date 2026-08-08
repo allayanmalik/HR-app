@@ -28,12 +28,18 @@
         { "name": "DB_HOST", "value": "hr-portal-db.c5m4oagyag9k.eu-west-2.rds.amazonaws.com" },
         { "name": "DB_PORT", "value": "5432" },
         { "name": "DB_USER", "value": "postgres" },
-        { "name": "DB_NAME", "value": "postgres" }
+        { "name": "DB_NAME", "value": "postgres" },
+        { "name": "SMTP_HOST", "value": "smtp.gmail.com" },
+        { "name": "SMTP_PORT", "value": "587" },
+        { "name": "SMTP_SECURE", "value": "false" },
+        { "name": "SMTP_USER", "value": "hrtest12647@gmail.com" },
+        { "name": "SMTP_FROM", "value": "hrtest12647@gmail.com" }
       ],
      "secrets": [
       { "name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:eu-west-2:805982516676:secret:hr-app/db-password-oBknhJ:password::" },
       { "name": "JWT_SECRET", "valueFrom": "arn:aws:secretsmanager:eu-west-2:805982516676:secret:hr-app/jwt-secret-BTqzKe:value::" },
-      { "name": "ADMIN_PASSWORD", "valueFrom": "arn:aws:secretsmanager:eu-west-2:805982516676:secret:hr-app/admin-password-XVUwJY:value::" }
+      { "name": "ADMIN_PASSWORD", "valueFrom": "arn:aws:secretsmanager:eu-west-2:805982516676:secret:hr-app/admin-password-XVUwJY:value::" },
+      { "name": "SMTP_PASS", "valueFrom": "arn:aws:secretsmanager:eu-west-2:805982516676:secret:hr-app/smtp-password-93sThY:value::" }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
