@@ -20,13 +20,20 @@
       ],
       "environment": [
         { "name": "NODE_ENV", "value": "production" },
-        { "name": "PORT", "value": "5000" },
-        { "name": "JWT_SECRET", "value": "replace-with-a-long-random-secret" },
-        { "name": "APP_URL", "value": "https://your-domain.example.com" },
+        { "name": "PORT", "value": "80" },
+        { "name": "APP_URL", "value": "https://am-service.co.uk" },
         { "name": "ADMIN_EMAIL", "value": "allayanmalik@gmail.com" },
-        { "name": "ADMIN_PASSWORD", "value": "replace-with-a-strong-password" },
         { "name": "AWS_REGION", "value": "eu-west-2" },
-        { "name": "S3_BUCKET", "value": "replace-with-your-s3-bucket-name" }
+        { "name": "S3_BUCKET", "value": "hr-app-docs-1892298022" },
+        { "name": "DB_HOST", "value": "hr-portal-db.c5m4oagyag9k.eu-west-2.rds.amazonaws.com" },
+        { "name": "DB_PORT", "value": "5432" },
+        { "name": "DB_USER", "value": "postgres" },
+        { "name": "DB_NAME", "value": "postgres" }
+      ],
+      "secrets": [
+        { "name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:eu-west-2:805982516676:secret:hr-app/db-password-oBknhJ" },
+        { "name": "JWT_SECRET", "valueFrom": "arn:aws:secretsmanager:eu-west-2:805982516676:secret:hr-app/jwt-secret-BTqzKe" },
+        { "name": "ADMIN_PASSWORD", "valueFrom": "arn:aws:secretsmanager:eu-west-2:805982516676:secret:hr-app/admin-password-XVUwJY" }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
