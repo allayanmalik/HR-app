@@ -40,7 +40,8 @@
         "options": {
           "awslogs-group": "/ecs/hr-app",
           "awslogs-region": "eu-west-2",
-          "awslogs-stream-prefix": "ecs"
+          "awslogs-stream-prefix": "ecs",
+          "awslogs-create-group": "true"
         }
       }
     }
