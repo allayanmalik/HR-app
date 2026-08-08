@@ -16,6 +16,8 @@ import { AWS_REGION, S3_BUCKET_NAME, deleteObjectFromS3, getDocumentUploadMiddle
 dotenv.config();
 
 const app = express();
+// Trust the first proxy hop (ALB/ECS) so req.ip reflects the real client IP for rate limiting
+app.set("trust proxy", 1);
 const JWT_SECRET = process.env.JWT_SECRET || "super-secret-production-key-change-me";
 const LEGACY_ADMIN_PASSWORD = "admin123";
 const LEGACY_ADMIN_PASSWORD_HASH = bcrypt.hashSync(LEGACY_ADMIN_PASSWORD, 10);
@@ -52,9 +54,33 @@ app.use((req, res, next) => {
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "same-origin");
   res.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
+  if (process.env.NODE_ENV === "production") {
+    res.setHeader("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload");
+  }
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
+
+// Lightweight in-memory rate limiter for all API routes (defense-in-depth against abuse/DoS)
+const apiRequestCounts = new Map();
+function apiRateLimiter(req, res, next) {
+  const key = req.ip || "unknown";
+  const now = Date.now();
+  const windowMs = 5 * 60 * 1000;
+  const maxRequests = 400;
+  const record = apiRequestCounts.get(key) || { count: 0, windowStart: now };
+  if (now - record.windowStart > windowMs) {
+    record.count = 0;
+    record.windowStart = now;
+  }
+  record.count += 1;
+  apiRequestCounts.set(key, record);
+  if (record.count > maxRequests) {
+    return res.status(429).json({ error: "Too many requests. Please slow down and try again shortly." });
+  }
+  next();
+}
+app.use("/api", apiRateLimiter);
 
 // Serve frontend if built
 const DIST_DIR = path.resolve("./dist");
@@ -232,6 +258,12 @@ const documentUpload = getDocumentUploadMiddleware();
 
 await bootstrapDatabase();
 
+// Check for staff whose right to work is approaching expiry and email the relevant admins/staff member
+runRtwExpiryCheck().catch((err) => console.error("Initial RTW expiry check failed", err && err.message ? err.message : err));
+setInterval(() => {
+  runRtwExpiryCheck().catch((err) => console.error("Scheduled RTW expiry check failed", err && err.message ? err.message : err));
+}, 24 * 60 * 60 * 1000);
+
 function authenticateToken(req, res, next) {
   const token = req.cookies.token;
   if (!token) return res.status(401).json({ error: "Authentication required" });
@@ -338,8 +370,41 @@ function normalizeRtw(rtw = {}) {
     manualDetails: rtw.manualDetails || "",
     lastVerifiedDate: rtw.lastVerifiedDate || "",
     verifiedBy: rtw.verifiedBy || "",
-    verificationNotes: rtw.verificationNotes || ""
+    verificationNotes: rtw.verificationNotes || "",
+    noTimeLimit: Boolean(rtw.noTimeLimit),
+    // Tracks the expiryDate value we last sent notifications for, so we never email twice for the same date
+    expiryNotifiedForDate: rtw.expiryNotifiedForDate || null
   };
+}
+
+function normalizeAddress(address = {}) {
+  const a = address || {};
+  return {
+    line1: a.line1 || "",
+    line2: a.line2 || "",
+    city: a.city || "",
+    postcode: a.postcode || ""
+  };
+}
+
+function normalizeSortCode(value = "") {
+  const digits = String(value || "").replace(/\D/g, "").slice(0, 6);
+  if (digits.length !== 6) return digits;
+  return `${digits.slice(0, 2)}-${digits.slice(2, 4)}-${digits.slice(4, 6)}`;
+}
+
+function daysUntil(dateStr) {
+  if (!dateStr) return null;
+  const target = new Date(`${dateStr}T00:00:00Z`).getTime();
+  if (Number.isNaN(target)) return null;
+  return Math.round((target - Date.now()) / 86400000);
+}
+
+function fmtDateForEmail(dateStr) {
+  if (!dateStr) return "an unknown date";
+  const date = new Date(`${dateStr}T00:00:00Z`);
+  if (Number.isNaN(date.getTime())) return dateStr;
+  return date.toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" });
 }
 
 function checkRateLimit(req, user) {
@@ -389,17 +454,51 @@ function passwordMatches(user, password) {
   return legacy;
 }
 
+const BRAND_NAME = "AM Service HR Portal";
+
+function escapeHtml(value = "") {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function buildBrandedEmail(subject, text) {
+  const brandedSubject = subject.toLowerCase().includes("am service hr portal") ? subject : `${BRAND_NAME}: ${subject}`;
+  const logoUrl = `${getAppBaseUrl()}/am-logo.jpg`;
+  const brandedText = `${BRAND_NAME}\n\n${text}\n\n— This is an automated message from ${BRAND_NAME}. Please do not reply to this email.`;
+  const brandedHtml = `
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:0 auto;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;">
+      <div style="text-align:center;padding:18px 0;background:#0f172a;">
+        <img src="${logoUrl}" alt="${BRAND_NAME}" style="height:44px;" />
+      </div>
+      <div style="padding:22px;color:#1e293b;font-size:14px;line-height:1.6;background:#ffffff;">
+        <p style="white-space:pre-line;margin:0 0 16px 0;">${escapeHtml(text)}</p>
+        <hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0;" />
+        <p style="color:#94a3b8;font-size:12px;margin:0;">This is an automated message from ${BRAND_NAME}. Please do not reply to this email.</p>
+      </div>
+    </div>`;
+  return { subject: brandedSubject, text: brandedText, html: brandedHtml };
+}
+
 async function sendNotificationEmail(to, subject, text) {
+  const branded = buildBrandedEmail(subject, text);
+
   // Prefer SES when explicitly enabled
   const ses = getSesClient();
   if (ses) {
     const source = process.env.SES_FROM || process.env.SMTP_FROM || "no-reply@hr-app.local";
     const command = new SendEmailCommand({
-      Source: source,
+      Source: `"${BRAND_NAME}" <${source}>`,
       Destination: { ToAddresses: [to] },
       Message: {
-        Subject: { Data: subject, Charset: "UTF-8" },
-        Body: { Text: { Data: text, Charset: "UTF-8" } }
+        Subject: { Data: branded.subject, Charset: "UTF-8" },
+        Body: {
+          Text: { Data: branded.text, Charset: "UTF-8" },
+          Html: { Data: branded.html, Charset: "UTF-8" }
+        }
       }
     });
     const info = await ses.send(command);
@@ -409,19 +508,79 @@ async function sendNotificationEmail(to, subject, text) {
 
   // If a verified SMTP transporter exists, use it and bubble send errors to callers
   if (mailTransporter) {
-    const info = await mailTransporter.sendMail({ from: process.env.SMTP_FROM || "no-reply@hr-app.local", to, subject, text });
+    const fromAddress = process.env.SMTP_FROM || "no-reply@hr-app.local";
+    const info = await mailTransporter.sendMail({
+      from: `"${BRAND_NAME}" <${fromAddress}>`,
+      to,
+      subject: branded.subject,
+      text: branded.text,
+      html: branded.html
+    });
     console.log(`[EMAIL] sent to=${to} messageId=${info.messageId}`);
     return;
   }
 
   // Dev fallback: log to console and return (does not throw)
   if (DEV_EMAIL_TO_CONSOLE) {
-    console.log(`[DEV EMAIL] to=${to}\nsubject=${subject}\n${text}`);
+    console.log(`[DEV EMAIL] to=${to}\nsubject=${branded.subject}\n${branded.text}`);
     return;
   }
 
   // No transporter and no dev fallback: throw so callers can handle the failure explicitly
   throw new Error("No SMTP/SES transporter configured and DEV_EMAIL_TO_CONSOLE is not enabled");
+}
+
+async function runRtwExpiryCheck() {
+  let changed = false;
+  for (const staff of db.staff) {
+    const rtw = staff.rtw;
+    if (!rtw || rtw.checkType === "not-required" || rtw.noTimeLimit || !rtw.expiryDate) continue;
+
+    const days = daysUntil(rtw.expiryDate);
+    if (days === null) continue;
+
+    const site = db.sites.find((s) => s.id === staff.siteId);
+    const noticeDaysRaw = Number(site?.rtwNoticeDays);
+    const noticeDays = Number.isFinite(noticeDaysRaw) && noticeDaysRaw > 0 ? noticeDaysRaw : 90;
+
+    if (days > noticeDays) continue; // Not within the notice window yet
+    if (rtw.expiryNotifiedForDate === rtw.expiryDate) continue; // Already notified for this expiry date
+
+    const fullName = `${staff.firstName} ${staff.lastName}`.trim();
+    const recipients = db.users.filter((u) => u.role === "admin" || (u.role === "subadmin" && (u.siteAccess || []).includes(staff.siteId)));
+    const staffUser = db.users.find((u) => u.staffId === staff.id);
+
+    for (const admin of recipients) {
+      try {
+        await sendNotificationEmail(
+          admin.email,
+          `Right to work expiring: ${fullName}`,
+          `${fullName}'s right to work is expiring on ${fmtDateForEmail(rtw.expiryDate)}. Please review their right to work details in the AM Service HR Portal.`
+        );
+      } catch (err) {
+        console.warn(`RTW expiry admin email failed for ${admin.email}`, err && err.message ? err.message : err);
+      }
+    }
+
+    if (staffUser) {
+      try {
+        await sendNotificationEmail(
+          staffUser.email,
+          "Your right to work is expiring soon",
+          `Your right to work is expiring soon and a new right to work code or details needs to be issued. You can update this yourself in the AM Service HR Portal under "My details", or contact your manager or HR for assistance.`
+        );
+      } catch (err) {
+        console.warn(`RTW expiry staff email failed for ${staffUser.email}`, err && err.message ? err.message : err);
+      }
+    }
+
+    rtw.expiryNotifiedForDate = rtw.expiryDate;
+    changed = true;
+  }
+
+  if (changed) {
+    await saveDbToDisk();
+  }
 }
 
 async function getDocuSignApiClient() {
@@ -469,7 +628,7 @@ app.post("/api/auth/login", async (req, res) => {
   const code = generateCode();
   pendingLogins.set(user.email.toLowerCase(), { code, userId: user.id, expiresAt: Date.now() + 5 * 60 * 1000, lastSentAt: Date.now() });
   try {
-    await sendNotificationEmail(user.email, "HR portal security code", `Your verification code is ${code}. It expires in 5 minutes.`);
+    await sendNotificationEmail(user.email, "Your security code", `Your AM Service HR Portal verification code is ${code}. It expires in 5 minutes.`);
     // Do NOT include the code in the response — it must be delivered only via email.
     res.json({ requires2FA: true, message: "A verification code was sent to your email." });
   } catch (error) {
@@ -505,7 +664,7 @@ app.post("/api/auth/resend-2fa", async (req, res) => {
   pending.expiresAt = Date.now() + 5 * 60 * 1000;
 
   try {
-    await sendNotificationEmail(user.email, "HR portal security code", `Your verification code is ${code}. It expires in 5 minutes.`);
+    await sendNotificationEmail(user.email, "Your security code", `Your AM Service HR Portal verification code is ${code}. It expires in 5 minutes.`);
     res.json({ message: "A new verification code was sent to your email." });
   } catch (error) {
     console.error(`Failed to resend 2FA code for ${user.email}`, error && error.message ? error.message : error);
@@ -523,7 +682,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
   const token = createPasswordResetToken(user, "reset");
   const link = `${getAppBaseUrl()}/?reset=${token}`;
   try {
-    await sendNotificationEmail(user.email, "Reset your HR portal password", `Use this link to create a new password: ${link}`);
+    await sendNotificationEmail(user.email, "Reset your password", `Use this link to create a new password for your AM Service HR Portal account: ${link}`);
     res.json({ message: "If an account exists for that email, a password reset link will be sent." });
   } catch (error) {
     console.warn("Password reset email failed; returning generic success response", error.message);
@@ -644,7 +803,7 @@ app.post("/api/admin-users", authenticateToken, requireAdmin, async (req, res) =
       "Set up your Business User account",
       (inviteLink) => `Welcome ${cleanName}.
 
-You have been granted Business User access to the HR portal with access to: ${assignedSiteNames}.
+You have been invited to AM Service HR Portal as a Business User with access to the following business location(s): ${assignedSiteNames}.
 
 Please check that your name and email are correct and create your password here: ${inviteLink}`,
       "business-user"
@@ -718,7 +877,7 @@ app.post("/api/admin-users/:id/resend-invite", authenticateToken, requireAdmin, 
       "Set up your Business User account",
       (inviteLink) => `Welcome ${user.name || user.email}.
 
-You have been granted Business User access to the HR portal with access to: ${assignedSiteNames}.
+You have been invited to AM Service HR Portal as a Business User with access to the following business location(s): ${assignedSiteNames}.
 
 Please create your password here: ${inviteLink}`,
       "business-user"
@@ -744,15 +903,29 @@ app.delete("/api/admin-users/:id", authenticateToken, requireAdmin, (req, res) =
 });
 
 app.post("/api/staff", authenticateToken, async (req, res) => {
-  const { firstName, lastName, email, phone, niNumber, siteId, jobTitle, startDate, dateOfBirth, rtw } = req.body;
+  const { firstName, lastName, email, phone, niNumber, siteId, jobTitle, startDate, dateOfBirth, rtw, address, bankAccountNumber, bankSortCode } = req.body;
   const newStaffId = "staff-" + Date.now();
 
-  if (!firstName || !lastName || !siteId || !dateOfBirth || !niNumber) {
-    return res.status(400).json({ error: "Name, business, date of birth, and NI number are required" });
+  const cleanFirstName = (firstName || "").trim();
+  const cleanLastName = (lastName || "").trim();
+  const cleanEmail = (email || "").trim().toLowerCase();
+
+  // Only name and email are mandatory. Business admins may fill in everything else,
+  // and the invited staff member can add or correct any remaining details themselves.
+  if (!cleanFirstName || !cleanLastName || !cleanEmail) {
+    return res.status(400).json({ error: "First name, last name, and email are required" });
   }
 
-  if (!isAdminLike(req.user) && !canManageSite(req.user, siteId)) {
-    return res.status(403).json({ error: "Access denied for this location" });
+  if (db.users.some((u) => u.email.toLowerCase() === cleanEmail)) {
+    return res.status(409).json({ error: "An account with that email already exists" });
+  }
+
+  if (siteId) {
+    if (!isAdminLike(req.user) && !canManageSite(req.user, siteId)) {
+      return res.status(403).json({ error: "Access denied for this location" });
+    }
+  } else if (req.user.role !== "admin") {
+    return res.status(400).json({ error: "A business/location is required unless you are a global admin" });
   }
 
   const normalizedRtw = normalizeRtw(rtw);
@@ -766,15 +939,18 @@ app.post("/api/staff", authenticateToken, async (req, res) => {
 
   const newStaff = {
     id: newStaffId,
-    firstName,
-    lastName,
-    email,
-    phone,
-    niNumber,
-    siteId,
-    jobTitle,
-    startDate,
-    dateOfBirth,
+    firstName: cleanFirstName,
+    lastName: cleanLastName,
+    email: cleanEmail,
+    phone: phone || "",
+    niNumber: niNumber || "",
+    siteId: siteId || null,
+    jobTitle: jobTitle || "",
+    startDate: startDate || "",
+    dateOfBirth: dateOfBirth || "",
+    address: normalizeAddress(address),
+    bankAccountNumber: String(bankAccountNumber || "").replace(/\s+/g, ""),
+    bankSortCode: normalizeSortCode(bankSortCode),
     training: [],
     documents: [],
     rtw: normalizedRtw
@@ -782,7 +958,7 @@ app.post("/api/staff", authenticateToken, async (req, res) => {
 
   const newUser = {
     id: "user-" + Date.now(),
-    email,
+    email: cleanEmail,
     passwordHash: null,
     role: "staff",
     staffId: newStaffId,
@@ -794,18 +970,20 @@ app.post("/api/staff", authenticateToken, async (req, res) => {
   db.users.push(newUser);
 
   try {
+    const site = siteId ? db.sites.find((s) => s.id === siteId) : null;
+    const siteName = site?.name || "your organisation";
     await sendInviteEmail(
       newUser,
-      "Set up your HR portal password",
-      (inviteLink) => `Welcome ${firstName}. This account lets you access only your own documents and contracts. Please create your password here: ${inviteLink}`,
+      "Set up your password",
+      (inviteLink) => `Welcome ${cleanFirstName}. AM Service HR Portal has invited you on behalf of ${siteName}. This account lets you access only your own documents and contracts, and you can add or correct your own personal details (such as address, bank details, and right to work information) once you sign in. Please create your password here: ${inviteLink}`,
       "staff"
     );
   } catch (error) {
-    console.warn(`Invite email failed for ${email}; staff record was still created`, error.message);
+    console.warn(`Invite email failed for ${cleanEmail}; staff record was still created`, error.message);
   }
 
   res.status(201).json(newStaff);
-  addAudit("staff_created", req.user, { staffId: newStaffId, email, siteId });
+  addAudit("staff_created", req.user, { staffId: newStaffId, email: cleanEmail, siteId });
   saveDbToDisk();
 });
 
@@ -825,10 +1003,12 @@ app.post("/api/staff/:id/resend-invite", authenticateToken, async (req, res) => 
   }
 
   try {
+    const site = db.sites.find((s) => s.id === staff.siteId);
+    const siteName = site?.name || "your organisation";
     await sendInviteEmail(
       user,
-      "Set up your HR portal password",
-      (inviteLink) => `Welcome ${staff.firstName}. This account lets you access only your own documents and contracts. Please create your password here: ${inviteLink}`,
+      "Set up your password",
+      (inviteLink) => `Welcome ${staff.firstName}. AM Service HR Portal has invited you on behalf of ${siteName}. This account lets you access only your own documents and contracts. Please create your password here: ${inviteLink}`,
       "staff"
     );
     res.json({ message: "Invitation resent successfully" });
@@ -843,25 +1023,49 @@ app.put("/api/staff/:id", authenticateToken, (req, res) => {
   if (index === -1) return res.status(404).json({ error: "Staff member not found" });
 
   const staff = db.staff[index];
-  if (!isAdminLike(req.user) && !canManageSite(req.user, staff.siteId)) {
+  const isSelf = req.user.role === "staff" && req.user.staffId === staff.id;
+  if (!isAdminLike(req.user) && !canManageSite(req.user, staff.siteId) && !isSelf) {
     return res.status(403).json({ error: "Access denied for this location" });
   }
 
+  let incoming = req.body || {};
+  if (isSelf) {
+    // Staff can add/correct their own personal details, but not business-controlled fields like site, job title, or documents
+    const allowedFields = ["firstName", "lastName", "email", "phone", "dateOfBirth", "niNumber", "address", "bankAccountNumber", "bankSortCode", "rtw"];
+    incoming = Object.fromEntries(Object.entries(incoming).filter(([key]) => allowedFields.includes(key)));
+  }
+
+  if (incoming.firstName !== undefined && !String(incoming.firstName).trim()) return res.status(400).json({ error: "First name cannot be empty" });
+  if (incoming.lastName !== undefined && !String(incoming.lastName).trim()) return res.status(400).json({ error: "Last name cannot be empty" });
+
+  if (incoming.email !== undefined) {
+    const normalizedEmail = String(incoming.email).trim().toLowerCase();
+    if (!normalizedEmail) return res.status(400).json({ error: "Email cannot be empty" });
+    if (db.users.some((u) => u.staffId !== req.params.id && u.email.toLowerCase() === normalizedEmail)) {
+      return res.status(409).json({ error: "An account with that email already exists" });
+    }
+    incoming.email = normalizedEmail;
+  }
+
   const updatedStaff = {
-    ...db.staff[index],
-    ...req.body,
+    ...staff,
+    ...incoming,
     id: req.params.id,
-    rtw: normalizeRtw(req.body.rtw || db.staff[index].rtw),
-    documents: normalizeDocuments(req.body.documents || db.staff[index].documents)
+    address: incoming.address !== undefined ? normalizeAddress(incoming.address) : staff.address,
+    bankAccountNumber: incoming.bankAccountNumber !== undefined ? String(incoming.bankAccountNumber).replace(/\s+/g, "") : staff.bankAccountNumber,
+    bankSortCode: incoming.bankSortCode !== undefined ? normalizeSortCode(incoming.bankSortCode) : staff.bankSortCode,
+    rtw: normalizeRtw(incoming.rtw || staff.rtw),
+    documents: normalizeDocuments(req.body.documents || staff.documents)
   };
   db.staff[index] = updatedStaff;
 
   const user = db.users.find((u) => u.staffId === req.params.id);
-  if (user) {
+  if (user && updatedStaff.email) {
     user.email = updatedStaff.email;
   }
 
   res.json(updatedStaff);
+  addAudit("staff_updated", req.user, { staffId: req.params.id, updatedFields: Object.keys(incoming), self: isSelf });
   saveDbToDisk();
 });
 
@@ -1033,7 +1237,9 @@ app.delete("/api/staff/:staffId/documents/:docId", authenticateToken, (req, res)
 
 app.post("/api/sites", authenticateToken, requireAdmin, (req, res) => {
   const assignedAdminIds = Array.isArray(req.body.assignedAdminIds) ? req.body.assignedAdminIds : [];
-  const site = { id: "site-" + Date.now(), ...req.body, assignedAdminIds };
+  const rtwNoticeDaysRaw = Number(req.body.rtwNoticeDays);
+  const rtwNoticeDays = Number.isFinite(rtwNoticeDaysRaw) && rtwNoticeDaysRaw > 0 ? Math.round(rtwNoticeDaysRaw) : 90;
+  const site = { id: "site-" + Date.now(), ...req.body, assignedAdminIds, rtwNoticeDays };
   db.sites.push(site);
 
   assignedAdminIds.forEach((adminId) => {
@@ -1044,6 +1250,30 @@ app.post("/api/sites", authenticateToken, requireAdmin, (req, res) => {
   });
 
   res.status(201).json(site);
+  saveDbToDisk();
+});
+
+// Update business details, including the right-to-work expiry notice period for that business
+app.put("/api/sites/:id", authenticateToken, (req, res) => {
+  const index = db.sites.findIndex((s) => s.id === req.params.id);
+  if (index === -1) return res.status(404).json({ error: "Business not found" });
+  if (!canManageSite(req.user, req.params.id)) return res.status(403).json({ error: "Access denied for this location" });
+
+  const { name, address, rtwNoticeDays, assignedAdminIds } = req.body;
+  const updated = { ...db.sites[index] };
+  if (typeof name === "string" && name.trim()) updated.name = name.trim();
+  if (typeof address === "string") updated.address = address;
+  if (rtwNoticeDays !== undefined) {
+    const days = Number(rtwNoticeDays);
+    updated.rtwNoticeDays = Number.isFinite(days) && days > 0 ? Math.round(days) : (updated.rtwNoticeDays || 90);
+  }
+  if (Array.isArray(assignedAdminIds) && isAdminLike(req.user)) {
+    updated.assignedAdminIds = assignedAdminIds;
+  }
+
+  db.sites[index] = updated;
+  res.json(updated);
+  addAudit("site_updated", req.user, { siteId: updated.id, updatedFields: Object.keys(req.body || {}) });
   saveDbToDisk();
 });
 
@@ -1099,7 +1329,7 @@ app.post("/api/contracts/assign", authenticateToken, async (req, res) => {
   };
   db.instances.push(instance);
   try {
-    await sendNotificationEmail(staff.email, "New contract assignment", `You have a new contract waiting for your signature: ${template.title}. Please sign it in the HR portal.`);
+    await sendNotificationEmail(staff.email, "New contract assignment", `You have a new contract waiting for your signature: ${template.title}. Please sign it in the AM Service HR Portal.`);
   } catch (error) {
     console.warn(`Contract email failed for ${staff.email}; contract record was still created`, error.message);
   }
@@ -1139,7 +1369,7 @@ app.post("/api/docusign/send-envelope", authenticateToken, async (req, res) => {
   });
 
   try {
-    await sendNotificationEmail(staff.email, "New contract request", `A new contract named ${title} is waiting for your signature. Please open the HR portal to review and sign it.`);
+    await sendNotificationEmail(staff.email, "New contract request", `A new contract named ${title} is waiting for your signature. Please open the AM Service HR Portal to review and sign it.`);
   } catch (error) {
     console.warn(`Envelope email failed for ${staff.email}; envelope was still created`, error.message);
   }
@@ -1172,7 +1402,7 @@ app.post("/api/contracts/upload", authenticateToken, async (req, res) => {
 
   db.instances.push(instance);
   try {
-    await sendNotificationEmail(staff.email, "New contract request", `A new contract named ${title} is waiting for your signature. Please open the HR portal to review and sign it.`);
+    await sendNotificationEmail(staff.email, "New contract request", `A new contract named ${title} is waiting for your signature. Please open the AM Service HR Portal to review and sign it.`);
   } catch (error) {
     console.warn(`Envelope email failed for ${staff.email}; contract was still created`, error && error.message ? error.message : error);
   }

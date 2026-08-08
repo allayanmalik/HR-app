@@ -4,8 +4,9 @@ import {
   Users, Building2, FileText, AlertTriangle, CheckCircle2, Plus, X,
   Pencil, Trash2, Search, ShieldCheck, Printer,
   LayoutDashboard, ClipboardList, Info, Download,
-  GraduationCap, LogOut, Lock, Mail, Paperclip, Upload
+  GraduationCap, LogOut, Lock, Mail, Paperclip, Upload, Bell
 } from "lucide-react";
+import amLogo from "./assets/am-logo.jpg";
 
 const API_BASE = (import.meta.env.VITE_API_URL || (import.meta.env.PROD ? "/api" : "http://localhost:80/api")).replace(/\/$/, "");
 
@@ -51,15 +52,21 @@ function formatCountdown(ms) {
   return `${seconds}s`;
 }
 
-function rtwInfo(staff) {
+function rtwInfo(staff, noticeDays) {
   const rtw = staff.rtw || {};
+  const threshold = Number(noticeDays) > 0 ? Number(noticeDays) : 90;
   if (rtw.checkType === "not-required") return { label: "Not required — British / Irish citizen", tone: "neutral", days: null };
   if (rtw.noTimeLimit) return { label: "No time limit on right to work", tone: "good", days: null };
   if (!rtw.expiryDate) return { label: "Expiry date not recorded", tone: "unknown", days: null };
   const days = daysBetween(rtw.expiryDate);
   if (days < 0) return { label: `Expired ${fmtDate(rtw.expiryDate)}`, tone: "bad", days };
-  if (days <= 90) return { label: `Expires ${fmtDate(rtw.expiryDate)} · ${days}d left`, tone: "warn", days };
+  if (days <= threshold) return { label: `Expires ${fmtDate(rtw.expiryDate)} · ${days}d left`, tone: "warn", days };
   return { label: `Valid until ${fmtDate(rtw.expiryDate)}`, tone: "good", days };
+}
+
+function noticeDaysForStaff(staff, sites) {
+  const site = (sites || []).find((s) => s.id === staff.siteId);
+  return site?.rtwNoticeDays;
 }
 
 function trainingStatus(expiryDate) {
@@ -320,10 +327,10 @@ function LoginPage({ onLoginSuccess }) {
     <div className="flex min-h-screen items-center justify-center bg-slate-100 p-4 font-sans text-slate-900">
       <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-xl sm:p-8">
         <div className="mb-6 text-center">
-          <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-slate-900 text-amber-400">
-            <ShieldCheck size={26} />
+          <div className="mx-auto mb-3 flex h-14 w-14 items-center justify-center overflow-hidden rounded-xl bg-slate-900">
+            <img src={amLogo} alt="AM Service HR Portal" className="h-11 w-11 object-contain" />
           </div>
-          <h1 className="text-xl font-bold text-slate-900">AM service</h1>
+          <h1 className="text-xl font-bold text-slate-900">AM Service HR Portal</h1>
           <p className="mt-1 text-xs text-slate-500">Secure sign-in using your portal credentials</p>
         </div>
 
@@ -398,6 +405,7 @@ export default function App() {
 
   const [staffModal, setStaffModal] = useState(null);
   const [siteModal, setSiteModal] = useState(false);
+  const [editingSite, setEditingSite] = useState(null);
   const [businessUserModal, setBusinessUserModal] = useState(false);
   const [editingAdminUser, setEditingAdminUser] = useState(null);
   const [templateModal, setTemplateModal] = useState(null);
@@ -535,6 +543,20 @@ export default function App() {
     showToast("Location added");
   };
 
+  const updateSite = async (siteData) => {
+    if (!siteData || !siteData.id) return;
+    await apiFetch(`/sites/${siteData.id}`, "PUT", siteData);
+    setEditingSite(null);
+    await loadData();
+    showToast("Business updated");
+  };
+
+  const saveMyDetails = async (staffData) => {
+    await apiFetch(`/staff/${staffData.id}`, "PUT", staffData);
+    await loadData();
+    showToast("Your details were updated");
+  };
+
   const saveSubAdmin = async (payload) => {
     await apiFetch("/admin-users", "POST", payload);
     setBusinessUserModal(false);
@@ -626,11 +648,11 @@ export default function App() {
       <header className="sticky top-0 z-30 border-b border-slate-200 bg-white/95 backdrop-blur">
         <div className="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-3 px-4 py-3">
           <div className="flex items-center gap-2">
-            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-900 text-amber-400">
-              <ShieldCheck size={18} />
+            <div className="flex h-9 w-9 items-center justify-center overflow-hidden rounded-lg bg-slate-900">
+              <img src={amLogo} alt="AM Service HR Portal" className="h-7 w-7 object-contain" />
             </div>
             <div>
-              <p className="text-sm font-bold leading-tight text-slate-900">AM service</p>
+              <p className="text-sm font-bold leading-tight text-slate-900">AM Service HR Portal</p>
               <p className="text-[11px] leading-tight text-slate-400">Role: {currentUser.role}</p>
             </div>
           </div>
@@ -704,6 +726,7 @@ export default function App() {
             dir={dir}
             adminUsers={adminUsers}
             onAdd={() => setSiteModal(true)}
+            onEdit={(s) => setEditingSite(s)}
             onDelete={(s) => setConfirmDelete({ type: "site", id: s.id, label: s.name })}
             onAddSubAdmin={() => setBusinessUserModal(true)}
             onEditAdmin={(u) => setEditingAdminUser(u)}
@@ -713,7 +736,7 @@ export default function App() {
         )}
 
         {currentUser.role === "staff" && staffMember && staffTab === "my-details" && (
-          <MyDetails staff={staffMember} site={dir.sites.find((s) => s.id === staffMember.siteId)} />
+          <MyDetails staff={staffMember} site={dir.sites.find((s) => s.id === staffMember.siteId)} onSave={saveMyDetails} />
         )}
         {currentUser.role === "staff" && staffMember && staffTab === "my-training" && <MyTraining staff={staffMember} />}
         {currentUser.role === "staff" && staffMember && staffTab === "my-contracts" && (
@@ -734,6 +757,7 @@ export default function App() {
         />
       )}
       {siteModal && <Modal title="Add business" onClose={() => setSiteModal(false)}><SiteForm adminUsers={adminUsers} onSave={saveSite} onCancel={() => setSiteModal(false)} /></Modal>}
+      {editingSite && <Modal title="Edit business" onClose={() => setEditingSite(null)}><SiteForm initial={editingSite} adminUsers={adminUsers} onSave={updateSite} onCancel={() => setEditingSite(null)} /></Modal>}
       {businessUserModal && <Modal title="Add business user" onClose={() => setBusinessUserModal(false)}><BusinessUserForm sites={dir.sites} onSave={saveSubAdmin} onCancel={() => setBusinessUserModal(false)} /></Modal>}
       {editingAdminUser && (
         <Modal title="Edit business user" onClose={() => setEditingAdminUser(null)}>
@@ -789,9 +813,12 @@ function NavBtn({ active, onClick, icon: Icon, label }) {
 }
 
 function Dashboard({ dir, contracts, goTab }) {
-  const expired = dir.staff.filter((s) => rtwInfo(s).tone === "bad");
-  const expiring = dir.staff.filter((s) => rtwInfo(s).tone === "warn");
+  const expired = dir.staff.filter((s) => rtwInfo(s, noticeDaysForStaff(s, dir.sites)).tone === "bad");
+  const expiring = dir.staff.filter((s) => rtwInfo(s, noticeDaysForStaff(s, dir.sites)).tone === "warn");
   const awaiting = contracts.instances.filter((c) => c.status === "sent");
+  const rtwNotifications = [...expired, ...expiring]
+    .map((s) => ({ staff: s, info: rtwInfo(s, noticeDaysForStaff(s, dir.sites)) }))
+    .sort((a, b) => (a.info.days ?? 0) - (b.info.days ?? 0));
 
   return (
     <div className="space-y-6">
@@ -803,6 +830,21 @@ function Dashboard({ dir, contracts, goTab }) {
       </div>
 
       <div className="grid gap-4 md:grid-cols-2">
+        <Panel title="Right to work notifications" onSeeAll={() => goTab("rtw")}>
+          {rtwNotifications.length === 0 ? <p className="py-4 text-sm text-slate-400">No right to work notifications.</p> : (
+            <ul className="divide-y divide-slate-100">
+              {rtwNotifications.map(({ staff, info }) => (
+                <li key={staff.id} className="flex items-center justify-between gap-3 py-2 text-sm">
+                  <div className="flex items-center gap-2">
+                    <Bell size={14} className={info.tone === "bad" ? "text-rose-500" : "text-amber-500"} />
+                    <span className="font-medium">{staff.firstName} {staff.lastName}</span>
+                  </div>
+                  <Badge tone={info.tone}>{info.label}</Badge>
+                </li>
+              ))}
+            </ul>
+          )}
+        </Panel>
         <Panel title="Contracts awaiting signature" onSeeAll={() => goTab("contracts")}>
           {awaiting.length === 0 ? <p className="py-4 text-sm text-slate-400">No pending contracts.</p> : (
             <ul className="divide-y divide-slate-100">
@@ -885,10 +927,38 @@ function StaffTab({ dir, onAdd, onEdit, onDelete, onResendInvite }) {
   );
 }
 
+const emptyAddress = { line1: "", line2: "", city: "", postcode: "" };
+
+/* Shared address + bank detail fields, reused by admin staff form and staff self-service form */
+function AddressBankFields({ form, setForm }) {
+  const address = form.address || emptyAddress;
+  return (
+    <div className="mt-3 space-y-3">
+      <div>
+        <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Address</p>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Address Line 1"><input className={inputCls} value={address.line1} onChange={(e) => setForm({ ...form, address: { ...address, line1: e.target.value } })} /></Field>
+          <Field label="Address Line 2"><input className={inputCls} value={address.line2} onChange={(e) => setForm({ ...form, address: { ...address, line2: e.target.value } })} /></Field>
+          <Field label="City / Town"><input className={inputCls} value={address.city} onChange={(e) => setForm({ ...form, address: { ...address, city: e.target.value } })} /></Field>
+          <Field label="Postcode"><input className={inputCls} value={address.postcode} onChange={(e) => setForm({ ...form, address: { ...address, postcode: e.target.value.toUpperCase() } })} /></Field>
+        </div>
+      </div>
+      <div>
+        <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Bank Details</p>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Bank Account Number"><input className={inputCls} maxLength={8} value={form.bankAccountNumber || ""} onChange={(e) => setForm({ ...form, bankAccountNumber: e.target.value.replace(/\D/g, "").slice(0, 8) })} /></Field>
+          <Field label="Bank Sort Code"><input className={inputCls} placeholder="00-00-00" value={form.bankSortCode || ""} onChange={(e) => setForm({ ...form, bankSortCode: e.target.value })} /></Field>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function StaffModal({ initial, sites, onClose, onSave }) {
   const [form, setForm] = useState(initial || {
     firstName: "", lastName: "", email: "", phone: "", niNumber: "",
     siteId: sites[0]?.id || "", jobTitle: "", startDate: todayISO(), dateOfBirth: "",
+    address: emptyAddress, bankAccountNumber: "", bankSortCode: "",
     rtw: { nationalityType: "british-irish", checkType: "not-required", shareCode: "", expiryDate: "", manualDetails: "" }
   });
   const [errors, setErrors] = useState({});
@@ -897,15 +967,17 @@ function StaffModal({ initial, sites, onClose, onSave }) {
 
   return (
     <Modal title={initial ? "Edit Staff" : "Add Staff"} onClose={onClose} wide>
+      <p className="mb-3 text-xs text-slate-500">Only first name, last name, and email are required. Everything else is optional here — the staff member can add or correct these details themselves after accepting their invitation.</p>
       <div className="grid gap-3 sm:grid-cols-2">
-        <Field label="First Name"><input className={inputCls} value={form.firstName} onChange={(e) => setForm({ ...form, firstName: e.target.value })} /></Field>
-        <Field label="Last Name"><input className={inputCls} value={form.lastName} onChange={(e) => setForm({ ...form, lastName: e.target.value })} /></Field>
-        <Field label="Email"><input className={inputCls} value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} /></Field>
+        <Field label="First Name *"><input className={inputCls} value={form.firstName} onChange={(e) => setForm({ ...form, firstName: e.target.value })} /></Field>
+        <Field label="Last Name *"><input className={inputCls} value={form.lastName} onChange={(e) => setForm({ ...form, lastName: e.target.value })} /></Field>
+        <Field label="Email *"><input className={inputCls} value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} /></Field>
         <Field label="Phone"><input className={inputCls} value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} /></Field>
         <Field label="Date of Birth"><input type="date" className={inputCls} value={form.dateOfBirth || ""} onChange={(e) => setForm({ ...form, dateOfBirth: e.target.value })} /></Field>
         <Field label="NI Number"><input className={inputCls} value={form.niNumber} onChange={(e) => setForm({ ...form, niNumber: e.target.value.toUpperCase() })} /></Field>
         <Field label="Business">
           <select className={inputCls} value={form.siteId} onChange={(e) => setForm({ ...form, siteId: e.target.value })}>
+            <option value="">Unassigned (global admin only)</option>
             {sites.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
         </Field>
@@ -934,15 +1006,14 @@ function StaffModal({ initial, sites, onClose, onSave }) {
         </div>
       )}
       <p className="mt-3 text-xs text-slate-500">If British/Irish is selected, right to work code is not required. For other nationalities, a right to work code or manual details are required.</p>
+      <AddressBankFields form={form} setForm={setForm} />
       <div className="mt-4 flex justify-end gap-2">
         <button className={btnSecondary} onClick={onClose}>Cancel</button>
         <button className={btnPrimary} onClick={() => {
           const newErrors = {};
           if (!form.firstName) newErrors.firstName = "First name is required";
           if (!form.lastName) newErrors.lastName = "Last name is required";
-          if (!form.siteId) newErrors.siteId = "Business is required";
-          if (!form.dateOfBirth) newErrors.dateOfBirth = "Date of birth is required";
-          if (!form.niNumber) newErrors.niNumber = "NI number is required";
+          if (!form.email) newErrors.email = "Email is required";
           setErrors(newErrors);
           if (Object.keys(newErrors).length === 0) onSave(form);
         }}>Save</button>
@@ -1131,7 +1202,7 @@ function RtwTab({ dir, onVerify }) {
   return (
     <div className="space-y-2">
       {dir.staff.map((s) => {
-        const info = rtwInfo(s);
+        const info = rtwInfo(s, noticeDaysForStaff(s, dir.sites));
         return (
           <div key={s.id} className="flex flex-col gap-3 rounded-xl border bg-white p-3.5 sm:flex-row sm:items-start sm:justify-between">
             <div>
@@ -1167,7 +1238,7 @@ function VerifyModal({ staff, onClose, onVerify }) {
   );
 }
 
-function SitesTab({ dir, adminUsers, onAdd, onDelete, onAddSubAdmin, onEditAdmin, onRemoveAdmin, onResendInvite }) {
+function SitesTab({ dir, adminUsers, onAdd, onDelete, onEdit, onAddSubAdmin, onEditAdmin, onRemoveAdmin, onResendInvite }) {
   const [now, setNow] = useState(Date.now());
 
   useEffect(() => {
@@ -1214,8 +1285,15 @@ function SitesTab({ dir, adminUsers, onAdd, onDelete, onAddSubAdmin, onEditAdmin
       <ul className="grid gap-3 sm:grid-cols-2">
         {dir.sites.map((s) => (
           <li key={s.id} className="flex justify-between rounded-xl border bg-white p-4">
-            <div><p className="font-semibold">{s.name}</p><p className="text-xs text-slate-400">{s.address}</p></div>
-            <button onClick={() => onDelete(s)} className="text-rose-600"><Trash2 size={15} /></button>
+            <div>
+              <p className="font-semibold">{s.name}</p>
+              <p className="text-xs text-slate-400">{s.address}</p>
+              <p className="mt-1 text-xs text-slate-500">Right to work notice: {s.rtwNoticeDays || 90} days before expiry</p>
+            </div>
+            <div className="flex items-start gap-1">
+              <button onClick={() => onEdit && onEdit(s)} className="p-2 text-slate-400 hover:text-slate-700"><Pencil size={15} /></button>
+              <button onClick={() => onDelete(s)} className="p-2 text-rose-600"><Trash2 size={15} /></button>
+            </div>
           </li>
         ))}
       </ul>
@@ -1223,10 +1301,11 @@ function SitesTab({ dir, adminUsers, onAdd, onDelete, onAddSubAdmin, onEditAdmin
   );
 }
 
-function SiteForm({ adminUsers, onSave, onCancel }) {
-  const [name, setName] = useState("");
-  const [address, setAddress] = useState("");
-  const [selectedAdmins, setSelectedAdmins] = useState([]);
+function SiteForm({ initial = null, adminUsers, onSave, onCancel }) {
+  const [name, setName] = useState(initial?.name || "");
+  const [address, setAddress] = useState(initial?.address || "");
+  const [rtwNoticeDays, setRtwNoticeDays] = useState(initial?.rtwNoticeDays || 90);
+  const [selectedAdmins, setSelectedAdmins] = useState(initial?.assignedAdminIds || []);
 
   const toggleAdmin = (adminId) => {
     setSelectedAdmins((current) => current.includes(adminId) ? current.filter((id) => id !== adminId) : [...current, adminId]);
@@ -1236,6 +1315,10 @@ function SiteForm({ adminUsers, onSave, onCancel }) {
     <div className="space-y-3">
       <Field label="Name"><input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} /></Field>
       <Field label="Address"><input className={inputCls} value={address} onChange={(e) => setAddress(e.target.value)} /></Field>
+      <Field label="Right to work expiry notice (days before expiry)">
+        <input type="number" min={1} className={inputCls} value={rtwNoticeDays} onChange={(e) => setRtwNoticeDays(e.target.value)} />
+        <p className="mt-1 text-xs text-slate-500">Business admins and the affected staff member will be emailed and notified on the dashboard this many days before a right to work expiry date.</p>
+      </Field>
       <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
         <p className="mb-2 text-sm font-medium text-slate-700">Assign business users</p>
         <div className="space-y-2">
@@ -1249,7 +1332,7 @@ function SiteForm({ adminUsers, onSave, onCancel }) {
       </div>
       <div className="mt-3 flex justify-end gap-2">
         <button className={btnSecondary} onClick={onCancel}>Cancel</button>
-        <button className={btnPrimary} onClick={() => onSave({ name, address, assignedAdminIds: selectedAdmins })}>Save</button>
+        <button className={btnPrimary} onClick={() => onSave({ id: initial?.id, name, address, rtwNoticeDays: Number(rtwNoticeDays) || 90, assignedAdminIds: selectedAdmins })}>Save</button>
       </div>
     </div>
   );
@@ -1402,12 +1485,108 @@ function UploadContractModal({ staff, onClose, onSave }) {
   );
 }
 
-function MyDetails({ staff, site }) {
+function MyDetails({ staff, site, onSave }) {
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState(staff);
+  const [errors, setErrors] = useState({});
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setForm(staff);
+  }, [staff]);
+
+  const rtwRequired = form.rtw?.nationalityType === "non-british-code" || form.rtw?.nationalityType === "non-british-manual";
+
+  const handleSave = async () => {
+    const newErrors = {};
+    if (!form.firstName) newErrors.firstName = "First name is required";
+    if (!form.lastName) newErrors.lastName = "Last name is required";
+    if (!form.email) newErrors.email = "Email is required";
+    setErrors(newErrors);
+    if (Object.keys(newErrors).length > 0) return;
+    setSaving(true);
+    try {
+      await onSave(form);
+      setEditing(false);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!editing) {
+    const info = rtwInfo(staff, site?.rtwNoticeDays);
+    return (
+      <div className="rounded-xl border border-slate-200 bg-white p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h2 className="text-xl font-bold">{staff.firstName} {staff.lastName}</h2>
+            <p className="text-sm text-slate-500">{site?.name}</p>
+          </div>
+          <button onClick={() => { setForm(staff); setEditing(true); }} className={`${btnSecondary} flex items-center gap-1.5 text-xs`}><Pencil size={14} /> Edit my details</button>
+        </div>
+        <div className="mt-4 grid gap-2 text-sm sm:grid-cols-2">
+          <p><span className="text-slate-400">Email:</span> {staff.email || "—"}</p>
+          <p><span className="text-slate-400">Phone:</span> {staff.phone || "—"}</p>
+          <p><span className="text-slate-400">Date of birth:</span> {staff.dateOfBirth ? fmtDate(staff.dateOfBirth) : "—"}</p>
+          <p><span className="text-slate-400">NI Number:</span> {staff.niNumber || "—"}</p>
+          <p className="sm:col-span-2"><span className="text-slate-400">Address:</span> {[staff.address?.line1, staff.address?.line2, staff.address?.city, staff.address?.postcode].filter(Boolean).join(", ") || "—"}</p>
+          <p><span className="text-slate-400">Bank account number:</span> {staff.bankAccountNumber || "—"}</p>
+          <p><span className="text-slate-400">Bank sort code:</span> {staff.bankSortCode || "—"}</p>
+        </div>
+        <div className="mt-4 border-t border-slate-100 pt-3">
+          <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-400">Right to work</p>
+          <Badge tone={info.tone}>{info.label}</Badge>
+          {staff.rtw?.shareCode && <p className="mt-2 text-xs text-slate-500">Share code: {staff.rtw.shareCode}</p>}
+          {staff.rtw?.manualDetails && <p className="mt-1 text-xs text-slate-500">Details: {staff.rtw.manualDetails}</p>}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="rounded-xl border border-slate-200 bg-white p-5">
-      <h2 className="text-xl font-bold">{staff.firstName} {staff.lastName}</h2>
-      <p className="text-sm text-slate-500">{site?.name}</p>
-      <p className="mt-2 text-sm font-mono">NI Number: {staff.niNumber || "N/A"}</p>
+      <div className="mb-3 flex items-center justify-between">
+        <h2 className="text-lg font-bold">Edit my details</h2>
+        <p className="text-xs text-slate-500">Correct any incorrect details below.</p>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label="First Name *"><input className={inputCls} value={form.firstName || ""} onChange={(e) => setForm({ ...form, firstName: e.target.value })} /></Field>
+        <Field label="Last Name *"><input className={inputCls} value={form.lastName || ""} onChange={(e) => setForm({ ...form, lastName: e.target.value })} /></Field>
+        <Field label="Email *"><input className={inputCls} value={form.email || ""} onChange={(e) => setForm({ ...form, email: e.target.value })} /></Field>
+        <Field label="Phone"><input className={inputCls} value={form.phone || ""} onChange={(e) => setForm({ ...form, phone: e.target.value })} /></Field>
+        <Field label="Date of Birth"><input type="date" className={inputCls} value={form.dateOfBirth || ""} onChange={(e) => setForm({ ...form, dateOfBirth: e.target.value })} /></Field>
+        <Field label="NI Number"><input className={inputCls} value={form.niNumber || ""} onChange={(e) => setForm({ ...form, niNumber: e.target.value.toUpperCase() })} /></Field>
+      </div>
+
+      <div className="mt-3">
+        <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Right to work</p>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Nationality">
+            <select className={inputCls} value={form.rtw?.nationalityType || "british-irish"} onChange={(e) => setForm({ ...form, rtw: { ...(form.rtw || {}), nationalityType: e.target.value, checkType: e.target.value === "british-irish" ? "not-required" : "manual" } })}>
+              <option value="british-irish">British/Irish Citizen</option>
+              <option value="non-british-code">Non-British citizen with right to work code</option>
+              <option value="non-british-manual">Non-British Citizen, manual details/passport number etc</option>
+            </select>
+          </Field>
+          {rtwRequired && (
+            <>
+              <Field label="Right to Work Code / Share Code"><input className={inputCls} value={form.rtw?.shareCode || ""} onChange={(e) => setForm({ ...form, rtw: { ...(form.rtw || {}), shareCode: e.target.value } })} /></Field>
+              <Field label="Right to Work Expires"><input type="date" className={inputCls} value={form.rtw?.expiryDate || ""} onChange={(e) => setForm({ ...form, rtw: { ...(form.rtw || {}), expiryDate: e.target.value } })} /></Field>
+              <Field label="Manual Details / Passport Number" className="sm:col-span-2"><textarea className={inputCls} rows={3} value={form.rtw?.manualDetails || ""} onChange={(e) => setForm({ ...form, rtw: { ...(form.rtw || {}), manualDetails: e.target.value } })} /></Field>
+            </>
+          )}
+        </div>
+      </div>
+
+      <AddressBankFields form={form} setForm={setForm} />
+
+      {Object.keys(errors).length > 0 && (
+        <div className="mt-3 rounded-lg bg-rose-50 p-3 text-sm text-rose-700">{Object.values(errors).map((m) => <div key={m}>{m}</div>)}</div>
+      )}
+      <div className="mt-4 flex justify-end gap-2">
+        <button className={btnSecondary} onClick={() => { setForm(staff); setErrors({}); setEditing(false); }}>Cancel</button>
+        <button className={btnPrimary} disabled={saving} onClick={handleSave}>{saving ? "Saving…" : "Save"}</button>
+      </div>
     </div>
   );
 }
