@@ -42,6 +42,15 @@ function fmtDateTime(iso) {
   return new Date(iso).toLocaleString("en-GB", { day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 
+function formatCountdown(ms) {
+  if (ms <= 0) return "0s";
+  const totalSeconds = Math.ceil(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
 function rtwInfo(staff) {
   const rtw = staff.rtw || {};
   if (rtw.checkType === "not-required") return { label: "Not required — British / Irish citizen", tone: "neutral", days: null };
@@ -205,6 +214,25 @@ function LoginPage({ onLoginSuccess }) {
   const [mode, setMode] = useState("login");
   const [resetToken, setResetToken] = useState("");
   const [newPassword, setNewPassword] = useState("");
+  const [resendAvailableAt, setResendAvailableAt] = useState(0);
+  const [resendCountdown, setResendCountdown] = useState(0);
+
+  useEffect(() => {
+    if (!requires2FA) {
+      setResendAvailableAt(0);
+      setResendCountdown(0);
+      return undefined;
+    }
+
+    const tick = () => {
+      const remaining = Math.max(0, resendAvailableAt - Date.now());
+      setResendCountdown(remaining);
+    };
+
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  }, [requires2FA, resendAvailableAt]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -216,6 +244,7 @@ function LoginPage({ onLoginSuccess }) {
         setPendingEmail(email);
         setRequires2FA(true);
         setCode("");
+        setResendAvailableAt(Date.now() + 30 * 1000);
         setSuccessMessage(data.message || "A verification code was sent to your email.");
         return;
       }
@@ -275,6 +304,18 @@ function LoginPage({ onLoginSuccess }) {
     }
   };
 
+  const handleResend2FA = async () => {
+    setError("");
+    setSuccessMessage("");
+    try {
+      const data = await apiFetch("/auth/resend-2fa", "POST", { email: pendingEmail });
+      setSuccessMessage(data.message || "A new verification code was sent to your email.");
+      setResendAvailableAt(Date.now() + 30 * 1000);
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
   return (
     <div className="flex min-h-screen items-center justify-center bg-slate-100 p-4 font-sans text-slate-900">
       <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-xl sm:p-8">
@@ -311,6 +352,9 @@ function LoginPage({ onLoginSuccess }) {
               <input className={`${inputCls} tracking-[0.3em]`} value={code} onChange={(e) => setCode(e.target.value)} placeholder="123456" maxLength={6} />
             </Field>
             <button type="submit" className={`${btnPrimary} w-full py-2.5`}>Verify Code</button>
+            <button type="button" onClick={handleResend2FA} disabled={resendCountdown > 0} className={`${btnSecondary} w-full disabled:cursor-not-allowed disabled:opacity-60`}>
+              {resendCountdown > 0 ? `Resend code in ${formatCountdown(resendCountdown)}` : "Resend verification email"}
+            </button>
             <button type="button" onClick={() => setRequires2FA(false)} className={`${btnSecondary} w-full`}>Back</button>
           </form>
         ) : (
@@ -332,9 +376,6 @@ function LoginPage({ onLoginSuccess }) {
           </form>
         )}
 
-        <div className="mt-6 border-t border-slate-100 pt-4">
-          <p className="mb-2 text-center text-xs font-semibold text-slate-400">Quick Test Credentials</p>
-        </div>
       </div>
     </div>
   );
@@ -469,6 +510,18 @@ export default function App() {
     await apiFetch(`/staff/${staffId}/documents/${docId}`, "DELETE");
     await loadData();
     showToast("Document removed");
+  };
+
+  const resendBusinessInvite = async (userId) => {
+    await apiFetch(`/admin-users/${userId}/resend-invite`, "POST");
+    await loadData();
+    showToast("Business user invitation resent");
+  };
+
+  const resendStaffInvite = async (staffId) => {
+    await apiFetch(`/staff/${staffId}/resend-invite`, "POST");
+    await loadData();
+    showToast("Staff invitation resent");
   };
 
   const downloadDocument = (staffId, docId) => {
@@ -616,6 +669,7 @@ export default function App() {
             onAdd={() => setStaffModal("new")}
             onEdit={(id) => setStaffModal(id)}
             onDelete={(s) => setConfirmDelete({ type: "staff", id: s.id, label: `${s.firstName} ${s.lastName}` })}
+            onResendInvite={(id) => resendStaffInvite(id)}
           />
         )}
         {hasAdminAccess && tab === "rtw" && <RtwTab dir={dir} onVerify={(id) => setVerifyStaffId(id)} />}
@@ -654,6 +708,7 @@ export default function App() {
             onAddSubAdmin={() => setBusinessUserModal(true)}
             onEditAdmin={(u) => setEditingAdminUser(u)}
             onRemoveAdmin={(id) => removeSubAdmin(id)}
+            onResendInvite={(id) => resendBusinessInvite(id)}
           />
         )}
 
@@ -787,7 +842,14 @@ function Panel({ title, onSeeAll, children }) {
   );
 }
 
-function StaffTab({ dir, onAdd, onEdit, onDelete }) {
+function StaffTab({ dir, onAdd, onEdit, onDelete, onResendInvite }) {
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
   return (
     <div className="space-y-4">
       <div className="flex justify-end gap-2">
@@ -799,8 +861,20 @@ function StaffTab({ dir, onAdd, onEdit, onDelete }) {
             <div>
               <p className="font-semibold">{s.firstName} {s.lastName}</p>
               <p className="text-xs text-slate-500">NI: {s.niNumber || "N/A"}</p>
+              {s.inviteStatus === "pending_invitation" && <Badge tone="warn">Invitation pending</Badge>}
             </div>
-            <div className="flex gap-1">
+            <div className="flex flex-wrap gap-1">
+              {s.inviteStatus === "pending_invitation" && (
+                <button
+                  onClick={() => onResendInvite(s.id)}
+                  disabled={s.inviteSentAt && (now - new Date(s.inviteSentAt).getTime() < 5 * 60 * 1000)}
+                  className={`${btnSecondary} text-xs disabled:cursor-not-allowed disabled:opacity-60`}
+                >
+                  {s.inviteSentAt && now - new Date(s.inviteSentAt).getTime() < 5 * 60 * 1000
+                    ? `Resend in ${formatCountdown(5 * 60 * 1000 - (now - new Date(s.inviteSentAt).getTime()))}`
+                    : "Resend invite"}
+                </button>
+              )}
               <button onClick={() => onEdit(s.id)} className="p-2 text-slate-400 hover:text-slate-700"><Pencil size={16} /></button>
               <button onClick={() => onDelete(s)} className="p-2 text-slate-400 hover:text-rose-600"><Trash2 size={16} /></button>
             </div>
@@ -1093,7 +1167,14 @@ function VerifyModal({ staff, onClose, onVerify }) {
   );
 }
 
-function SitesTab({ dir, adminUsers, onAdd, onDelete, onAddSubAdmin, onEditAdmin, onRemoveAdmin }) {
+function SitesTab({ dir, adminUsers, onAdd, onDelete, onAddSubAdmin, onEditAdmin, onRemoveAdmin, onResendInvite }) {
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap gap-2">
@@ -1108,9 +1189,21 @@ function SitesTab({ dir, adminUsers, onAdd, onDelete, onAddSubAdmin, onEditAdmin
               <div>
                 <div className="font-medium">{user.name || user.email}</div>
                 <div className="text-xs text-slate-500">{user.email}</div>
+                {user.inviteStatus === "pending_invitation" && <Badge tone="warn">Invitation pending</Badge>}
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <span className="text-xs text-slate-500 mr-2">{user.siteAccess?.length ? `${user.siteAccess.length} location(s)` : "No locations"}</span>
+                {user.inviteStatus === "pending_invitation" && (
+                  <button
+                    onClick={() => onResendInvite(user.id)}
+                    disabled={user.inviteSentAt && (now - new Date(user.inviteSentAt).getTime() < 5 * 60 * 1000)}
+                    className={`${btnSecondary} text-xs disabled:cursor-not-allowed disabled:opacity-60`}
+                  >
+                    {user.inviteSentAt && now - new Date(user.inviteSentAt).getTime() < 5 * 60 * 1000
+                      ? `Resend in ${formatCountdown(5 * 60 * 1000 - (now - new Date(user.inviteSentAt).getTime()))}`
+                      : "Resend invite"}
+                  </button>
+                )}
                 <button onClick={() => onEditAdmin && onEditAdmin(user)} className="p-2 text-slate-400 hover:text-slate-700"><Pencil size={14} /></button>
                 <button onClick={() => onRemoveAdmin && onRemoveAdmin(user.id)} className="p-2 text-slate-400 hover:text-rose-600"><Trash2 size={14} /></button>
               </div>

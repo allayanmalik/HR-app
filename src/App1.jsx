@@ -332,9 +332,6 @@ function LoginPage({ onLoginSuccess }) {
           </form>
         )}
 
-        <div className="mt-6 border-t border-slate-100 pt-4">
-          <p className="mb-2 text-center text-xs font-semibold text-slate-400">Quick Test Credentials</p>
-        </div>
       </div>
     </div>
   );

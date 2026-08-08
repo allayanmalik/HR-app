@@ -23,6 +23,8 @@ const LEGACY_ADMIN_PASSWORD_HASH = bcrypt.hashSync(LEGACY_ADMIN_PASSWORD, 10);
 const loginAttempts = new Map();
 const pendingLogins = new Map();
 const passwordResetTokens = new Map();
+const INVITE_RESEND_WINDOW_MS = 5 * 60 * 1000;
+const TWO_FA_RESEND_WINDOW_MS = 30 * 1000;
 
 if (process.env.NODE_ENV === "production" && (!process.env.JWT_SECRET || process.env.JWT_SECRET === "super-secret-production-key-change-me")) {
   console.error("Insecure JWT_SECRET detected in production. Set a strong JWT_SECRET environment variable.");
@@ -143,6 +145,33 @@ function buildInitialUsers() {
       siteAccess: []
     }
   ];
+}
+
+function getUserInviteStatus(user) {
+  if (!user) return "unknown";
+  if (user.mustSetPassword || !user.passwordHash) return "pending_invitation";
+  return "active";
+}
+
+async function sendInviteEmail(user, subject, body, invitationType = "invite") {
+  user.inviteSentAt = new Date().toISOString();
+  user.inviteType = invitationType;
+  const token = createPasswordResetToken(user, "setup");
+  const inviteLink = `${getAppBaseUrl()}/?setPassword=${token}`;
+  await sendNotificationEmail(user.email, subject, body(inviteLink));
+  return inviteLink;
+}
+
+function ensureInviteCooldown(user) {
+  const lastSentAt = user?.inviteSentAt ? new Date(user.inviteSentAt).getTime() : 0;
+  const remaining = INVITE_RESEND_WINDOW_MS - (Date.now() - lastSentAt);
+  return remaining > 0 ? remaining : 0;
+}
+
+function ensure2FACooldown(pending) {
+  const lastSentAt = pending?.lastSentAt || 0;
+  const remaining = TWO_FA_RESEND_WINDOW_MS - (Date.now() - lastSentAt);
+  return remaining > 0 ? remaining : 0;
 }
 
 let db = {
@@ -438,7 +467,7 @@ app.post("/api/auth/login", async (req, res) => {
   clearRateLimit(req);
 
   const code = generateCode();
-  pendingLogins.set(user.email.toLowerCase(), { code, userId: user.id, expiresAt: Date.now() + 5 * 60 * 1000 });
+  pendingLogins.set(user.email.toLowerCase(), { code, userId: user.id, expiresAt: Date.now() + 5 * 60 * 1000, lastSentAt: Date.now() });
   try {
     await sendNotificationEmail(user.email, "HR portal security code", `Your verification code is ${code}. It expires in 5 minutes.`);
     // Do NOT include the code in the response — it must be delivered only via email.
@@ -448,6 +477,39 @@ app.post("/api/auth/login", async (req, res) => {
     // Remove pending code so there's no dangling value
     pendingLogins.delete(user.email.toLowerCase());
     return res.status(500).json({ error: "Failed to deliver verification code. Contact the administrator." });
+  }
+});
+
+app.post("/api/auth/resend-2fa", async (req, res) => {
+  const { email } = req.body;
+  const key = (email || "").toLowerCase();
+  const pending = pendingLogins.get(key);
+  if (!pending) {
+    return res.status(404).json({ error: "No pending verification code found" });
+  }
+
+  const cooldown = ensure2FACooldown(pending);
+  if (cooldown > 0) {
+    return res.status(429).json({ error: "Please wait 30 seconds before resending the verification email", retryAfterSeconds: Math.ceil(cooldown / 1000) });
+  }
+
+  const user = db.users.find((u) => u.id === pending.userId);
+  if (!user) {
+    pendingLogins.delete(key);
+    return res.status(404).json({ error: "User not found" });
+  }
+
+  const code = generateCode();
+  pending.code = code;
+  pending.lastSentAt = Date.now();
+  pending.expiresAt = Date.now() + 5 * 60 * 1000;
+
+  try {
+    await sendNotificationEmail(user.email, "HR portal security code", `Your verification code is ${code}. It expires in 5 minutes.`);
+    res.json({ message: "A new verification code was sent to your email." });
+  } catch (error) {
+    console.error(`Failed to resend 2FA code for ${user.email}`, error && error.message ? error.message : error);
+    return res.status(500).json({ error: "Failed to resend verification code" });
   }
 });
 
@@ -520,8 +582,11 @@ app.get("/api/auth/me", authenticateToken, (req, res) => {
 });
 
 function withDocumentMeta(staffMember) {
+  const account = db.users.find((user) => user.staffId === staffMember.id);
   return {
     ...staffMember,
+    inviteStatus: getUserInviteStatus(account),
+    inviteSentAt: account?.inviteSentAt || null,
     documents: (staffMember.documents || []).map(({ documentBase64, ...meta }) => meta)
   };
 }
@@ -540,7 +605,11 @@ app.get("/api/directory", authenticateToken, (req, res) => {
 });
 
 app.get("/api/admin-users", authenticateToken, requireAdmin, (req, res) => {
-  const users = db.users.filter((user) => user.role === "admin" || user.role === "subadmin");
+  const users = db.users.filter((user) => user.role === "admin" || user.role === "subadmin").map((user) => ({
+    ...user,
+    inviteStatus: getUserInviteStatus(user),
+    inviteSentAt: user.inviteSentAt || null
+  }));
   res.json({ users });
 });
 
@@ -568,20 +637,17 @@ app.post("/api/admin-users", authenticateToken, requireAdmin, async (req, res) =
 
   db.users.push(newUser);
 
-  // Generate the setup link and send the email, include their assigned sites for verification
-  const inviteToken = createPasswordResetToken(newUser, "setup");
-  const inviteLink = `${getAppBaseUrl()}/?setPassword=${inviteToken}`;
-  const assignedSiteNames = (db.sites || []).filter((s) => (newUser.siteAccess || []).includes(s.id)).map((s) => s.name).join(", ") || "(none)";
-
   try {
-    await sendNotificationEmail(
-      normalizedEmail,
+    const assignedSiteNames = (db.sites || []).filter((s) => (newUser.siteAccess || []).includes(s.id)).map((s) => s.name).join(", ") || "(none)";
+    await sendInviteEmail(
+      newUser,
       "Set up your Business User account",
-      `Welcome ${cleanName}.
+      (inviteLink) => `Welcome ${cleanName}.
 
 You have been granted Business User access to the HR portal with access to: ${assignedSiteNames}.
 
-Please check that your name and email are correct and create your password here: ${inviteLink}`
+Please check that your name and email are correct and create your password here: ${inviteLink}`,
+      "business-user"
     );
   } catch (error) {
     // If email failed, remove the user we just pushed and return an error so the admin can retry with corrected SMTP settings.
@@ -590,7 +656,7 @@ Please check that your name and email are correct and create your password here:
     return res.status(500).json({ error: "Failed to send invite email. User was not created." });
   }
 
-  res.status(201).json({ user: newUser, message: "Invitation email sent successfully" });
+  res.status(201).json({ user: { ...newUser, inviteStatus: getUserInviteStatus(newUser) }, message: "Invitation email sent successfully" });
   addAudit("admin_user_created", req.user, { createdUserId: newUser.id, createdUserEmail: newUser.email, siteAccess: newUser.siteAccess });
   saveDbToDisk();
 });
@@ -633,6 +699,35 @@ app.put("/api/admin-users/:id", authenticateToken, requireAdmin, async (req, res
   res.json({ user });
   addAudit("admin_user_updated", req.user, { updatedUserId: user.id, updatedFields: Object.keys(req.body || {}) });
   saveDbToDisk();
+});
+
+app.post("/api/admin-users/:id/resend-invite", authenticateToken, requireAdmin, async (req, res) => {
+  const user = db.users.find((u) => u.id === req.params.id);
+  if (!user) return res.status(404).json({ error: "User not found" });
+  if (user.role !== "subadmin") return res.status(400).json({ error: "Only business users can receive invite emails" });
+
+  const cooldown = ensureInviteCooldown(user);
+  if (cooldown > 0) {
+    return res.status(429).json({ error: "Please wait 5 minutes before resending the invitation", retryAfterSeconds: Math.ceil(cooldown / 1000) });
+  }
+
+  try {
+    const assignedSiteNames = (db.sites || []).filter((s) => (user.siteAccess || []).includes(s.id)).map((s) => s.name).join(", ") || "(none)";
+    await sendInviteEmail(
+      user,
+      "Set up your Business User account",
+      (inviteLink) => `Welcome ${user.name || user.email}.
+
+You have been granted Business User access to the HR portal with access to: ${assignedSiteNames}.
+
+Please create your password here: ${inviteLink}`,
+      "business-user"
+    );
+    res.json({ message: "Invitation resent successfully" });
+  } catch (error) {
+    console.error(`Failed to resend invite to ${user.email}`, error && error.message ? error.message : error);
+    return res.status(500).json({ error: "Failed to resend invitation" });
+  }
 });
 
 // Delete admin/subadmin user
@@ -691,16 +786,20 @@ app.post("/api/staff", authenticateToken, async (req, res) => {
     passwordHash: null,
     role: "staff",
     staffId: newStaffId,
-    mustSetPassword: true
+    mustSetPassword: true,
+    inviteType: "staff"
   };
 
   db.staff.push(newStaff);
   db.users.push(newUser);
 
-  const inviteToken = createPasswordResetToken(newUser, "setup");
-  const inviteLink = `${getAppBaseUrl()}/?setPassword=${inviteToken}`;
   try {
-    await sendNotificationEmail(email, "Set up your HR portal password", `Welcome ${firstName}. Please create your password here: ${inviteLink}`);
+    await sendInviteEmail(
+      newUser,
+      "Set up your HR portal password",
+      (inviteLink) => `Welcome ${firstName}. This account lets you access only your own documents and contracts. Please create your password here: ${inviteLink}`,
+      "staff"
+    );
   } catch (error) {
     console.warn(`Invite email failed for ${email}; staff record was still created`, error.message);
   }
@@ -708,6 +807,35 @@ app.post("/api/staff", authenticateToken, async (req, res) => {
   res.status(201).json(newStaff);
   addAudit("staff_created", req.user, { staffId: newStaffId, email, siteId });
   saveDbToDisk();
+});
+
+app.post("/api/staff/:id/resend-invite", authenticateToken, async (req, res) => {
+  const staff = db.staff.find((s) => s.id === req.params.id);
+  if (!staff) return res.status(404).json({ error: "Staff member not found" });
+  if (!isAdminLike(req.user) && !canManageSite(req.user, staff.siteId)) {
+    return res.status(403).json({ error: "Access denied for this location" });
+  }
+
+  const user = db.users.find((u) => u.staffId === staff.id);
+  if (!user) return res.status(404).json({ error: "Linked user account not found" });
+
+  const cooldown = ensureInviteCooldown(user);
+  if (cooldown > 0) {
+    return res.status(429).json({ error: "Please wait 5 minutes before resending the invitation", retryAfterSeconds: Math.ceil(cooldown / 1000) });
+  }
+
+  try {
+    await sendInviteEmail(
+      user,
+      "Set up your HR portal password",
+      (inviteLink) => `Welcome ${staff.firstName}. This account lets you access only your own documents and contracts. Please create your password here: ${inviteLink}`,
+      "staff"
+    );
+    res.json({ message: "Invitation resent successfully" });
+  } catch (error) {
+    console.warn(`Failed to resend invite to ${user.email}; invite was not sent`, error.message);
+    return res.status(500).json({ error: "Failed to resend invitation" });
+  }
 });
 
 app.put("/api/staff/:id", authenticateToken, (req, res) => {
