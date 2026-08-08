@@ -1,5 +1,5 @@
 {
-  "family": "hr-app",
+  "family": "hr-app-task",
   "networkMode": "awsvpc",
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "512",
